@@ -1,0 +1,1490 @@
+;;; stp-controller.el --- Controller for package operations -*- lexical-binding: t; -*-
+
+;;; Code:
+
+(require 'info)
+(require 'stp-headers)
+(require 'stp-latest)
+(require 'stp-options)
+(require 'stp-utils)
+(require 'stp-git)
+(require 'stp-elpa)
+(require 'stp-archive)
+(require 'stp-emacsmirror)
+(require 'stp-url)
+
+(defvar stp-auto-commit t
+  "When non-nil, automatically commit changes.
+
+Note that even if this is omitted, some operations (such as
+subtree operations) inherently involve commits and this cannot be
+disabled. When this variable is a function, it should take zero
+or two arguments.
+
+When it is called with two arguments they are the name of the
+current package or group and the options object for the current
+operation. The function is called with no arguments in contexts
+where there is no current package or group. The return value
+determines the effective value of the variable.")
+
+(defvar stp-auto-push t
+  "When non-nil, automatically push commits.
+
+This has no effect unless `stp-auto-commit' is non-nil. The value
+can also be a function as for `stp-auto-commit'.")
+
+(defvar stp-auto-lock nil
+  "When non-nil, automatically update `stp-lock-file' when packages are changed.
+
+The value can also be a function as for `stp-auto-commit'.")
+
+(defvar stp-auto-reset '(:audit)
+  "A list that indicates when git reset should be used.
+
+If it contains :audit, reset when an audit fails. If it contains
+:error, reset when errors occur. Instead of a list, the value t
+is also allowed and is equivalent to \\='(:audit :error). The
+value can also be a function as for `stp-auto-commit'.")
+
+(defvar stp-audit-changes t
+  "Show diffs whenever a package changes or new code is added.
+
+This is useful for security purposes since it prevents new code
+from being run before it has been reviewed. The value can also be
+a function as for `stp-auto-commit'.")
+
+(defvar stp-auto-dependencies t
+  "When non-nil, automatically install or upgrade dependencies as needed.
+
+This applies when installing, uninstalling, upgrading or
+reinstalling packages.")
+
+(defvar stp-always-upgrade-dependencies nil
+  "When non-nil, always upgrade the dependencies of packages.
+
+This occurs when a package is installed or upgraded. When nil,
+only the dependencies that need to be upgraded to satisfy the
+package's requirements will be upgraded. The value can also be a
+function as for `stp-auto-commit'.")
+
+(defvar stp-auto-toggle-update nil
+  "When non-nil, set the update attribute when a git package is upgraded.
+
+This is useful when the update attribute is stable but an
+unstable version is installed or vice versa. The value can also
+be a function as for `stp-auto-commit'.")
+
+(defvar stp-auto-post-actions t
+  "When non-nil, automatically perform post actions.
+
+Post actions can be individually enabled or disabled via
+`stp-auto-update-load-path', `stp-auto-load', `stp-auto-build',
+`stp-auto-build-info' and `stp-auto-update-info-directories'. The
+value can also be a function as for `stp-auto-commit'.")
+
+(defvar stp-auto-tag t
+  "When non-nil, tag the commit when bumping to a new version.
+
+The value can also be a function as for `stp-auto-commit'.")
+
+(defvar stp-auto-update-load-path t
+  "When non-nil, automatically update the load path.
+
+The value can also be a function as for `stp-auto-commit'.")
+
+(defvar stp-auto-load t
+  "When non-nil, automatically load packages.
+
+The value can also be a function as for `stp-auto-commit'.")
+
+(defvar stp-auto-build nil
+  "When non-nil, automatically build pacakges.
+
+General methods which may fail for some packages are used. The
+value can also be a function as for `stp-auto-commit'.")
+
+(defvar stp-auto-build-info t
+  "When non-nil, automatically build info manuals.
+
+When this variable is a function it will be called to determine
+the value when it is needed. The value can also be a function as
+for `stp-auto-commit'.")
+
+(defvar stp-auto-update-info-directories t
+  "When non-nil, automatically update the info directories.
+
+When this variable is a function it will be called to determine
+the value when it is needed. The value can also be a function as
+for `stp-auto-commit'.")
+
+(defclass stp-operation ()
+  ((pkg-name :initarg :pkg-name :initform nil)
+   ;; This overrides the controller's options slot in `stp-execute' when
+   ;; non-nil.
+   (options :initarg :options :initform nil)
+   (reportable :initarg :reportable :initform t)))
+
+(defclass stp-package-operation (stp-operation) ())
+
+(defclass stp-package-change-operation (stp-package-operation) ())
+
+(defclass stp-uninstall-operation (stp-package-change-operation)
+  ((remove-from-groups :initarg :remove-from-groups :initform t)))
+
+(defclass stp-post-action-operation (stp-package-operation) ())
+
+(defclass stp-skippable-package-operation (stp-package-operation)
+  ((allow-skip :initarg :allow-skip :initform t)))
+
+(defvar stp-enforce-min-version nil
+  "Determines if the user is allowed to select a version older than the minimum.
+
+The minimum is the version required by another package.")
+
+(defclass stp-additive-operation (stp-package-change-operation stp-skippable-package-operation)
+  ((dependency :initarg :dependency :initform nil)
+   (ignorable :initarg :ignorable :initform t)
+   (min-version :initarg :min-version :initform nil)
+   (enforce-min-version :initarg :enforce-min-version :initform (symbol-value 'stp-enforce-min-version))
+   (prompt-prefix :initarg :prompt-prefix :initform "")))
+
+(defclass stp-install-operation (stp-additive-operation)
+  ((pkg-alist :initarg :pkg-alist :initform nil)))
+
+(defclass stp-upgrade-operation (stp-additive-operation)
+  ((new-version :initarg :new-version :initform nil)))
+
+(defclass stp-install-or-upgrade-operation (stp-install-operation stp-upgrade-operation)
+  ((new-version :initarg :new-version :initform nil)))
+
+(defclass stp-reinstall-operation (stp-additive-operation)
+  ((new-version :initarg :new-version :initform nil)))
+
+(cl-defgeneric stp-reportable (operation)
+  (:documentation
+   "Determine if the operation is reportable."))
+
+(cl-defmethod stp-reportable ((operation stp-operation))
+  (oref operation reportable))
+
+(cl-defmethod stp-reportable ((_operation stp-install-or-upgrade-operation))
+  nil)
+
+(cl-defgeneric stp-validate-options (options)
+  (:documentation
+   "Determine if the OPTIONS passed are valid.
+
+Signal an appropriate error if they are not."))
+
+(cl-defmethod stp-validate-options ((_options stp-operation-options))
+  t)
+
+(cl-defmethod stp-validate-options ((options stp-basic-operation-options))
+  (with-slots (do-commit do-push)
+      options
+    (when (and (not (stp-maybe-call do-commit)) (stp-maybe-call do-push))
+      (user-error "Pushing without committing is not allowed")))
+  (cl-call-next-method))
+
+(cl-defmethod stp-validate-options ((options stp-bump-operation-options))
+  (with-slots (do-commit do-tag)
+      options
+    (when (and (not (stp-maybe-call do-commit)) (stp-maybe-call do-tag))
+      (user-error "Tagging without committing is not allowed"))
+    (cl-call-next-method)))
+
+(defun stp-package-candidate-names ()
+  (->> (append (stp-archive-package-names) (stp-emacsmirror-package-names))
+       -uniq
+       (-sort #'string<)))
+
+(defun stp-abbreviate-remote-version (method remote version)
+  "Abbreviate long VERSION hashes to make them more readable.
+
+Other versions are not abbreviated. METHOD and REMOTE specify the
+remote and method attributes for the package."
+  (cond
+   ((and (eq method 'git) (not (stp-git-valid-remote-ref-p remote version)))
+    (stp-git-abbreviate-hash version))
+   ((eq method 'git)
+    (stp-git-normalize-version remote version))
+   (t
+    version)))
+
+(cl-defun stp-list-read-name (prompt)
+  "If it exists, return the package on the current line.
+
+Otherwise, prompt the user for a package with PROMPT."
+  (stp-refresh-info)
+  (or (and (derived-mode-p 'stp-list-mode)
+           (stp-list-package-on-line))
+      (stp-read-existing-name prompt)))
+
+(defun stp-list-package-on-line (&optional offset)
+  "Return the name of the package on the current line.
+
+When OFFSET is non-nil, return the name of the packages that is
+OFFSET lines from the current line or nil if no package
+corresponds to that line."
+  (stp-refresh-info)
+  (when (derived-mode-p 'stp-list-mode)
+    (setq offset (or offset 0))
+    (let ((line (line-number-at-pos)))
+      (save-excursion
+        (forward-line offset)
+        (when (= (line-number-at-pos) (+ line offset))
+          (when-let* ((pkg-name (save-excursion
+                                  (beginning-of-line)
+                                  (rem-plain-symbol-at-point))))
+            (and (not (save-excursion
+                        (beginning-of-line)
+                        (bobp)))
+                 (not (save-excursion
+                        (end-of-line)
+                        (eobp)))
+                 (not (string= pkg-name ""))
+                 (member pkg-name (stp-info-names))
+                 pkg-name)))))))
+
+(defun stp-unclean-fun ()
+  "This function is intended as a value of `stp-allow-unclean'.
+
+It requires the repository to be clean when run inside
+`stp-source-directory'. Otherwise, it causes the user to be
+prompted."
+  (rem-ancestor-of-inclusive-p (stp-git-root) stp-source-directory))
+
+(defvar stp-allow-unclean #'stp-unclean-fun
+  "This variable determines the behavior when the git repository is unclean.
+
+When the value is nil, an error occurs. :allow means that the
+command should proceed without user intervention. If the value is
+a function, it will be called with no arguments and the return
+value will be interpreted as described here. Any other value
+means that the user should be prompted to determine if the
+command should proceed.")
+
+(defun stp-maybe-ensure-clean ()
+  (let ((unclean (if (functionp stp-allow-unclean)
+                     (funcall stp-allow-unclean)
+                   stp-allow-unclean)))
+    (or (eq unclean :allow)
+        (stp-git-clean-p)
+        (and (not unclean)
+             (user-error "Aborted: the repository is unclean"))
+        (yes-or-no-p "The git repo is unclean. Proceed anyway?"))))
+
+(defun stp-user-audit (_pkg-name _diff-buf)
+  (prog1
+      ;; Treat `keyboard-quit' as nil. Otherwise,
+      ;; `stp-source-directory' will be left in an inconsistent state.
+      (condition-case nil
+          (yes-or-no-p "Are the changes to the package safe? ")
+        (quit nil))
+    (stp-git-bury-diff-buffer)))
+
+(defvar stp-audit-function #'stp-user-audit)
+
+(defun stp-audit-changes (pkg-name type last-hash options)
+  (unless (memq type '(install upgrade))
+    (error "The type must be either 'install or 'upgrade"))
+  ;; Skip the audit when there are no changes.
+  (unless (stp-git-hash= last-hash (stp-git-head))
+    (stp-git-show-diff (list last-hash))
+    (unless (funcall stp-audit-function pkg-name (get-buffer stp-git-diff-buffer-name))
+      (let ((reset (stp-maybe-call (oref options do-reset) pkg-name options)))
+        (when (or (eq reset t) (memq :audit reset))
+          (stp-git-reset last-hash :mode 'hard))
+        (signal 'quit
+                (list (format "aborted %s %s due to a failed security audit%s"
+                              (if (eq type 'install)
+                                  "installing"
+                                "upgrading")
+                              pkg-name
+                              (if reset
+                                  ""
+                                ": use git reset to undo the suspicious commits"))))))))
+
+(defun stp-maybe-audit-changes (pkg-name type last-hash options)
+  (with-slots (do-reset do-audit)
+      options
+      (when (stp-maybe-call do-audit pkg-name options)
+        (stp-audit-changes pkg-name type last-hash options))))
+
+(defun stp-upgrade-handle-merge-conflicts ()
+  (let ((first t))
+    (while (stp-git-merge-conflict-p)
+      (stp-msg "%s Resolve the conflict(s) and then press M-x `exit-recursive-edit'"
+               (if first
+                   "One or more merge conflicts occurred while upgrading."
+                 "One or more merge conflicts are still unresolved."))
+      (recursive-edit)
+      (setq first nil))))
+
+(defun stp-sort-remotes (remotes)
+  "Sort the alist REMOTES that maps remotes to methods by method.
+
+This is done according to the order in `stp-methods-order'.
+REMOTES may also contain strings that map to remote symbols
+representing archives."
+  (seq-sort-by (lambda (remote)
+                 (let ((method-or-archive (cdr remote)))
+                   (list (cl-position (if (not (memq method-or-archive stp-methods-order))
+                                          'archive
+                                        method-or-archive)
+                                      stp-methods-order)
+                         (or (and (stringp method-or-archive)
+                                  (cl-position (stp-emacsmirror-remote-mirror method-or-archive)
+                                               stp-emacsmirrors
+                                               :test #'equal))
+                             -1))))
+               (fn (or (< (car %1) (car %2))
+                       (and (= (car %1) (car %2))
+                            (< (cadr %1) (cadr %2)))))
+               remotes))
+
+(defun stp-find-remotes (pkg-name)
+  (let* ((archives (stp-archives pkg-name))
+         (archive-alist (mapcar (lambda (archive)
+                                  (cons (intern archive) (intern archive)))
+                                archives))
+         (remotes (append (stp-archive-find-remotes pkg-name)
+                          (stp-emacsmirror-find-remotes pkg-name)
+                          (mapcar (fn (cons % 'elpa))
+                                  (stp-elpa-package-urls pkg-name archives)))))
+    (->> (append remotes archive-alist)
+         -uniq
+         stp-sort-remotes
+         (mapcar #'car))))
+
+(cl-defun stp-read-remote-or-archive (prompt &key pkg-name default-remote (prompt-prefix "") (read-remote t))
+  "Read a package name and remote or a package archive using PROMPT.
+
+When PKG-NAME is non-nil, only select remotes for that package.
+DEFAULT-REMOTE is used as the default when completing remotes.
+When PROMPT-PREFIX is non-nil, it will be prepended to the
+prompt. When READ-REMOTE is nil, the user will not be prompted
+for the remote or archive.
+
+When the input is ambiguous and could be package name or a local
+path, it will be treated as a package name unless it contains a
+slash. Return a cons cell the contains the package name and the
+remote or archive. Archives are represented as symbols."
+  (stp-archive-ensure-loaded)
+  (let* ((archive-names (if pkg-name
+                            (ensure-list (cl-find pkg-name (stp-archive-package-names) :test #'string=))
+                          (stp-archive-package-names)))
+         (name-or-remote (stp-comp-read-remote prompt archive-names :default default-remote :normalize nil)))
+    (if (member name-or-remote archive-names)
+        (progn
+          ;; If the user chose a package name, find remotes from
+          ;; `package-archive-contents' and allow the user to choose one.
+          (setq pkg-name name-or-remote)
+          (let* ((archives (stp-archives pkg-name))
+                 (archive-alist (mapcar (lambda (archive)
+                                          (cons (format "%s (package archive)" archive)
+                                                (intern archive)))
+                                        archives))
+                 (remotes (append (-filter (fn (not (stp-elpa-valid-remote-p (car %))))
+                                           (stp-archive-find-remotes pkg-name))
+                                  (stp-emacsmirror-find-remotes pkg-name)
+                                  (mapcar (fn (cons % 'elpa))
+                                          (stp-elpa-package-urls pkg-name archives :annotate t))))
+                 (remote-or-archive (and read-remote
+                                         (stp-comp-read-remote
+                                          "Remote or archive: "
+                                          (->> (append remotes archive-alist)
+                                               stp-sort-remotes
+                                               (mapcar #'car))))))
+            (cons pkg-name (and remote-or-archive
+                                (or (map-elt archive-alist remote-or-archive)
+                                    (car (s-split " " remote-or-archive)))))))
+      ;; Otherwise the user chose a remote so prompt for its package name.
+      (let ((remote (stp-normalize-remote name-or-remote)))
+        (cons (or pkg-name (stp-read-name (stp-prefix-prompt prompt-prefix "Package name: ") :default (stp-default-name remote)))
+              remote)))))
+
+(defun stp-download-url (pkg-name pkg-alist)
+  (let-alist pkg-alist
+    ;; Note that for the 'git method there is no download URL.
+    (cl-ecase .method
+      (elpa
+       (stp-elpa-download-url pkg-name .remote .version))
+      (archive
+       ;; .remote is a symbol representing the archive for the 'archive method.
+       (stp-archive-download-url pkg-name .remote))
+      (url
+       .remote))))
+
+(defun stp-post-actions (pkg-name options)
+  (with-slots (do-update-load-path
+               do-load
+               do-build
+               do-build-info
+               do-update-info-directories)
+      options
+    (when (stp-maybe-call do-update-load-path pkg-name options)
+      (stp-update-load-path (stp-full-path pkg-name)))
+    (when (stp-maybe-call do-build pkg-name options)
+      (stp-build pkg-name))
+    (when (stp-maybe-call do-load pkg-name options)
+      (condition-case err
+          (stp-reload pkg-name)
+        (error (display-warning '(stp controller) (format "Error while loading %s modules: %s" pkg-name (error-message-string err))))))
+    (when (stp-maybe-call do-build-info pkg-name options)
+      (stp-build-info pkg-name))
+    (when (stp-maybe-call do-update-info-directories pkg-name options)
+      (stp-update-info-directories pkg-name))))
+
+(defvar stp-build-output-buffer-name "*STP Build Output*")
+
+(defun stp-build (pkg-name &optional allow-naive-byte-compile)
+  "Build the package PKG-NAME.
+
+This is done by running the appropriate build systems or
+performing naive byte compilation. ALLOW-NAIVE-BYTE-COMPILE
+controls whether naive byte compilation is allowed. Return
+non-nil if there were no errors."
+  (when pkg-name
+    (let* ((output-buffer stp-build-output-buffer-name)
+           (pkg-path (stp-canonical-path pkg-name))
+           (build-dir pkg-path))
+      ;; Setup output buffer
+      (get-buffer-create output-buffer)
+      ;; Handle CMake separately. Since it generates makefiles, make may need
+      ;; to be run afterwards.
+      (when (f-exists-p (f-expand "CMakeLists.txt" pkg-path))
+        (stp-msg "CMakeLists.txt was found in %s. Attempting to run cmake..." build-dir)
+        ;; Try to use the directory build by default. It is fine if
+        ;; this directory already exists as long as it is not tracked
+        ;; by git.
+        (setq build-dir (f-expand "build" pkg-path))
+        (when (and (f-exists-p build-dir)
+                   (stp-git-tracked-p build-dir))
+          (setq build-dir (f-expand (make-temp-file "build-") pkg-path)))
+        (unless (f-exists-p build-dir)
+          (make-directory build-dir))
+        (let ((default-directory build-dir))
+          (let ((cmd '("cmake" "..")))
+            (stp-before-build-command cmd output-buffer)
+            ;; This will use `build-dir' as the build directory and
+            ;; `pkg-path' as the source directory so there is no
+            ;; ambiguity as to which CMakeLists.txt file should be
+            ;; used.
+            (unless (eql (rem-run-command cmd :buffer output-buffer) 0)
+              (stp-msg "Failed to run cmake on %s" build-dir)))))
+      (let ((success
+             ;; Try different methods of building the package until one
+             ;; succeeds.
+             (or nil
+                 ;; Handle GNU make. We use a separate binding for
+                 ;; `default-directory' here because the cmake code above
+                 ;; can change build-dir.
+                 (let ((default-directory build-dir))
+                   (when (-any (lambda (file)
+                                 (f-exists-p file))
+                               stp-gnu-makefile-names)
+                     (stp-msg "A makefile was found in %s. Attempting to run make..." build-dir)
+                     (let ((cmd '("make")))
+                       (stp-before-build-command cmd output-buffer)
+                       ;; Make expects a makefile to be in the current directory
+                       ;; so there is no ambiguity over which makefile will be
+                       ;; used.
+                       (or (eql (rem-run-command cmd :buffer output-buffer) 0)
+                           (and (stp-msg "Failed to run make on %s" pkg-path)
+                                nil)))))
+                 (and allow-naive-byte-compile
+                      (let ((default-directory pkg-path))
+                        (stp-msg "Attempting to byte compile files in %s..." pkg-path)
+                        (condition-case nil
+                            (progn
+                              ;; Put the messages from `byte-recompile-directory' in
+                              ;; output-buffer.
+                              (dflet ((stp-msg (&rest args)
+                                               (with-current-buffer output-buffer
+                                                 (insert (apply #'format args)))))
+                                (stp-before-build-command "Byte compiling files" output-buffer)
+                                ;; Packages have to be compiled and loaded twice
+                                ;; to ensure that macros will work.
+                                (byte-recompile-directory pkg-path 0)
+                                (stp-reload-once pkg-name)
+                                (byte-recompile-directory pkg-path 0)
+                                (stp-reload-once pkg-name))
+                              t)
+                          (error (stp-msg "Byte-compiling %s failed" pkg-path)
+                                 nil)))))))
+        ;; Return success or failure
+        (if success
+            (stp-msg "Successfully built %s" pkg-name)
+          (stp-msg "Build failed for %s" pkg-name))
+        success))))
+
+(cl-defun stp-reload (pkg-name &key quiet)
+  "Reload the package PKG-NAME.
+
+When QUIET is non-nil, suppress messages."
+  (interactive (list (stp-list-read-name "Package name: ")))
+  ;; Reload the package twice so that macros are handled properly.
+  (stp-reload-once pkg-name)
+  (stp-reload-once pkg-name)
+  (unless quiet
+    (stp-msg "Reloaded %s" pkg-name)))
+
+(defun stp-build-info (pkg-name)
+  "Build the info manuals for PKG-NAME."
+  (interactive (list (stp-list-read-name "Package name: ")))
+  (when pkg-name
+    (let* ((makefiles (f-entries (stp-canonical-path pkg-name)
+                                 (lambda (path)
+                                   (member (f-filename path) stp-gnu-makefile-names))
+                                 t))
+           (output-buffer stp-build-output-buffer-name)
+           (texi-target (concat pkg-name ".texi"))
+           (target (concat pkg-name ".info"))
+           attempted
+           (success
+            ;; Try to build the info manual in different ways until one succeeds.
+            (or nil
+                ;; Try to find a makefile that has an appropriate target.
+                (cl-dolist (makefile makefiles)
+                  (when (member target (stp-make-targets makefile))
+                    (let ((default-directory (f-dirname makefile)))
+                      (setq attempted t)
+                      (stp-msg "Makefile with target %s found in %s. Attempting to run make..." target (f-dirname makefile))
+                      (let ((cmd (list "make" target)))
+                        (stp-before-build-command cmd output-buffer)
+                        (if (eql (rem-run-command cmd :buffer output-buffer) 0)
+                            (progn
+                              (stp-msg "Built the info manual for %s using make" pkg-name)
+                              (cl-return t))
+                          (stp-msg "'%s' failed in %s" cmd (f-dirname makefile)))))))
+
+                ;; Try to compile a texi file directly.
+                (cl-dolist (source (f-entries (stp-canonical-path pkg-name)
+                                              (lambda (path)
+                                                (string= (f-filename path) texi-target))
+                                              t))
+                  (let ((default-directory (f-dirname source)))
+                    (setq attempted t)
+                    (stp-msg "texi source file found at %s. Attempting to compile it with makeinfo..." source)
+                    (let ((cmd (list "makeinfo" "--no-split" texi-target)))
+                      (cond
+                       (;; Don't build texi files unless they have changed since the info
+                        ;; manual was last built.
+                        (f-newer-p (f-swap-ext source "info") source)
+                        (stp-msg "The info manual for %s is up to date" pkg-name)
+                        (cl-return t))
+                       ((progn
+                          (stp-before-build-command cmd output-buffer)
+                          (eql (rem-run-command cmd :buffer output-buffer) 0))
+                        (stp-msg "Built the info manual for %s using makeinfo" pkg-name)
+                        (cl-return t))
+                       (t
+                        (stp-msg "'%s' failed" cmd)))))))))
+      (unless attempted
+        (stp-msg "No makefiles or texi source files found for the %s info manual" pkg-name))
+      success)))
+
+(defun stp-update-info-directories (pkg-name &optional quiet)
+  "Make the info files for PKG-NAME available to info commands.
+
+QUIET suppresses messages."
+  (interactive (list (stp-list-read-name "Package name: ")))
+  (when pkg-name
+    (let* ((directory (stp-canonical-path pkg-name))
+           (new (mapcar 'f-dirname
+                        (f-entries directory
+                                   (-partial #'string-match-p "\\.info$")
+                                   t))))
+      (info-initialize)
+      (setq Info-directory-list
+            (cl-remove-duplicates (append Info-directory-list new)
+                                  :test #'equal))
+      (unless quiet
+        (if new
+            (stp-msg "Added info files for %s" pkg-name)
+          (stp-msg "No info files found for %s" pkg-name))))))
+
+(defun stp-update-lock-file (&optional interactive-p)
+  "Write the hash of the git repository to the lock file.
+
+INTERACTIVE-P is non-nil when the function is called interactively."
+  (interactive (list t))
+  (stp-with-package-source-directory
+    (let ((hash (stp-git-rev-to-hash stp-source-directory "HEAD")))
+      (with-temp-buffer
+        (insert (format "%S\n" hash))
+        (f-write (buffer-string) 'utf-8 stp-lock-file)
+        (when interactive-p
+          (stp-msg "Updated the lock file at %s" stp-lock-file))))))
+
+(cl-defun stp-read-package (&key pkg-name pkg-alist (prompt-prefix "") min-version enforce-min-version)
+  (plet* ((`(,pkg-name . ,remote)
+           (-> (stp-prefix-prompt prompt-prefix "Package name or remote: ")
+               (stp-read-remote-or-archive
+                :pkg-name pkg-name
+                :default-remote (map-elt pkg-alist 'remote))))
+          (method (stp-remote-method remote)))
+    (let (version update branch)
+      (cl-ecase method
+        (git
+         (unless (stp-git-valid-remote-p remote)
+           (user-error (stp-prefix-prompt prompt-prefix "Invalid git repository (or host is down): %s") remote))
+         (unless update
+           (setq update (stp-git-read-update (stp-prefix-prompt prompt-prefix "Update policy: ")
+                                             :default (map-elt pkg-alist 'update)
+                                             :remote remote
+                                             :other-remotes (map-elt pkg-alist 'other-remotes))))
+         (when (and (eq update 'unstable)
+                    (not branch))
+           (setq branch (stp-git-read-branch (stp-prefix-prompt prompt-prefix "Branch: ") remote (map-elt pkg-alist 'branch))))
+         (unless version
+           (setq version (stp-git-read-version
+                          (stp-prefix-prompt prompt-prefix (format "Version%s: " (stp-min-version-annotation min-version enforce-min-version)))
+                          remote
+                          :extra-versions (list (map-elt pkg-alist 'version) branch)
+                          :default (map-elt pkg-alist 'version)
+                          :min-version (and enforce-min-version min-version))))
+         `(,pkg-name
+           (method . ,method)
+           (remote . ,remote)
+           (version . ,version)
+           (update . ,update)
+           (branch . ,branch)))
+        ;; Archives only have one version so the minimum version cannot be
+        ;; enforced.
+        (archive
+         `(,pkg-name
+           (method . ,method)
+           (remote . ,remote)))
+        ((elpa url)
+         (unless (or (and (string-match-p rem-strict-url-regexp remote)
+                          (url-file-exists-p remote))
+                     ;; Allow local files too.
+                     (f-exists-p remote))
+           (user-error (stp-prefix-prompt prompt-prefix "Invalid URL (or host is down): %s") remote))
+         (unless version
+           (cl-ecase method
+             (elpa (setq version (stp-elpa-read-version
+                                  (stp-prefix-prompt prompt-prefix "Version: ")
+                                  pkg-name
+                                  remote
+                                  :min-version (and enforce-min-version min-version))))
+             (url (setq version (stp-url-read-version (stp-prefix-prompt prompt-prefix "Version: "))))))
+         `(,pkg-name
+           (method . ,method)
+           (remote . ,remote)
+           (version . ,version)))))))
+
+;; Handles queries that might need to be done interactively such as determining
+;; which remotes, versions and so forth should be used during installation and
+;; upgrades. This can be done either interactively or via some policy like
+;; preferring the latest stable or unstable. It also handles callbacks to
+;; higher-level code (such as requesting that dependencies be installed).
+(defclass stp-controller ()
+  ((options :initarg :options)
+   (operations :initarg :operations :initform nil)
+   (history :initarg :history :initform nil)))
+
+(defclass stp-interactive-controller (stp-controller) ())
+
+(defclass stp-auto-controller (stp-controller)
+  ((preferred-update :initarg :preferred-update :initform 'stable)
+   (respect-update :initarg :respect-update :initform t)
+   (development-directory-override :initarg :development-directory-override :initform 'unstable)))
+
+(cl-defgeneric stp-controller-filter-history (controller status))
+
+(cl-defmethod stp-controller-filter-history ((controller stp-controller) status)
+  (-filter (fn (eq (plist-get % :status) status)) (oref controller history)))
+
+(defvar stp-default-controller-class 'stp-auto-controller)
+(defvar stp-default-controller-args nil)
+
+(cl-defgeneric stp-make-controller-get-class-args (options))
+
+(cl-defmethod stp-make-controller-get-class-args ((_options stp-operation-options))
+  (list stp-default-controller-class stp-default-controller-args))
+
+(cl-defmethod stp-make-controller-get-class-args ((options stp-controlled-operation-options))
+  (list (oref options controller-class) (oref options make-controller-args)))
+
+(cl-defgeneric stp-make-controller (options &rest args)
+  "Make a new controller of class `stp-default-controller-class'.
+
+The controller is created using OPTIONS and ARGS (which is merged
+with `stp-default-controller-args').")
+
+(cl-defmethod stp-make-controller ((options stp-operation-options) &rest args)
+  (dsb (class default-args)
+      (stp-make-controller-get-class-args options)
+    (apply class :options options (map-merge 'plist default-args args))))
+
+(cl-defgeneric stp-controller-append-operations (controller &rest operations)
+  (:documentation
+   "Append the specified operations to CONTROLLER's list of
+operations to perform."))
+
+(cl-defmethod stp-controller-append-operations ((controller stp-controller) &rest new-operations)
+  (with-slots (operations)
+      controller
+    (setf operations (append operations new-operations))))
+
+(cl-defgeneric stp-controller-prepend-operations (controller &rest operations)
+  (:documentation
+   "Prepend the specified operations to CONTROLLER's list of
+operations to perform."))
+
+(cl-defmethod stp-controller-prepend-operations ((controller stp-controller) &rest new-operations)
+  (with-slots (operations)
+      controller
+    (setf operations (append new-operations operations))))
+
+(cl-defgeneric stp-controller-get-package (controller pkg-name prompt-prefix min-version enforce-min-version)
+  (:documentation
+   "Query CONTROLLER for a package."))
+
+(cl-defmethod stp-controller-get-package ((_controller stp-interactive-controller) pkg-name prompt-prefix min-version enforce-min-version)
+  (stp-read-package :pkg-name pkg-name
+                    :prompt-prefix prompt-prefix
+                    :min-version min-version
+                    :enforce-min-version enforce-min-version))
+
+(defun stp-enforce-min-version (pkg-name version min-version enforce-min-version)
+  (when (and min-version enforce-min-version (not (stp-version<= min-version version)))
+    (error "The newest version for %s is %s but at least %s is required" pkg-name version min-version)))
+
+(cl-defgeneric stp-controller-actual-update (controller pkg-name pkg-alist remote)
+  "Determine the update parameter using CONTROLLER.
+
+PKG-NAME is the name of the package, PKG-ALIST contains the
+package alist and REMOTE is the remote.")
+
+(cl-defmethod stp-controller-actual-update ((controller stp-auto-controller) _pkg-name pkg-alist remote)
+  (with-slots (preferred-update respect-update development-directory-override)
+      controller
+    (let-alist pkg-alist
+      ;; Respect the package's update attribute if it is set and the controller
+      ;; is set to do respect package's update attributes.
+      (cond
+       ((and respect-update .update)
+        .update)
+       ;; Always prefer the unstable version when the remote is in the
+       ;; development directory.
+       ((and development-directory-override
+             (not (symbolp remote))
+             (f-dir-p remote)
+             (-any (lambda (dir)
+                     (rem-ancestor-of-inclusive-p dir remote))
+                   (stp-development-directories)))
+        'unstable)
+       (t
+        preferred-update)))))
+
+(cl-defgeneric stp-controller-preferred-git-version (controller pkg-name pkg-alist remote min-version))
+
+(cl-defmethod stp-controller-preferred-git-version :around ((_controller stp-controller) _pkg-name _pkg-alist remote _min-version)
+  (let ((version (cl-call-next-method)))
+    (stp-git-normalize-version remote version)))
+
+(cl-defmethod stp-controller-preferred-git-version ((controller stp-auto-controller) pkg-name pkg-alist remote min-version)
+  (with-slots (preferred-update)
+      controller
+    (let (latest-stable
+          (branch (car (stp-git-remote-heads-sorted remote)))
+          (actual-update (stp-controller-actual-update controller pkg-name pkg-alist remote)))
+      (if (and (eq actual-update 'stable)
+               (setq latest-stable (stp-git-latest-stable-version remote))
+               ;; If there's a minimum version and the
+               ;; latest stable is not recent enough,
+               ;; use the development version.
+               (or (not min-version)
+                   (stp-version<= min-version latest-stable)))
+          latest-stable
+        branch))))
+
+(cl-defmethod stp-controller-get-package ((controller stp-auto-controller) pkg-name prompt-prefix min-version enforce-min-version)
+  (plet* ((`(,pkg-name . ,remote)
+           (or (and pkg-name
+                    (cons pkg-name nil))
+               (-> (stp-prefix-prompt prompt-prefix "Package name or remote: ")
+               (stp-read-remote-or-archive :pkg-name pkg-name :read-remote nil))))
+          (remote (or remote (car (stp-find-remotes pkg-name))))
+          (method (stp-remote-method remote)))
+    (append `(,pkg-name
+              (method . ,method)
+              (remote . ,remote))
+            (cl-ecase method
+              (git
+               (let* ((branch (car (stp-git-remote-heads-sorted remote)))
+                      (version (stp-controller-preferred-git-version controller pkg-name nil remote min-version))
+                      (update (if (string= version branch) 'unstable 'stable)))
+                 (stp-enforce-min-version pkg-name version min-version enforce-min-version)
+                 `((version . ,version)
+                   (update . ,update)
+                   (branch . ,branch))))
+              (elpa
+               (let ((version (car (stp-elpa-versions-sorted pkg-name remote))))
+                 (stp-enforce-min-version pkg-name version min-version enforce-min-version)
+                 `((version . ,version))))
+              (archive)
+              (url
+               `((version . ,(stp-url-default-version))))))))
+
+(cl-defgeneric stp-controller-get-remote (controller prompt remote other-remotes)
+  (:documentation
+   "Query CONTROLLER for a remote."))
+
+(cl-defmethod stp-controller-get-remote ((_controller stp-interactive-controller) prompt remote other-remotes)
+  (stp-choose-remote prompt remote other-remotes))
+
+(cl-defmethod stp-controller-get-remote ((_controller stp-auto-controller) _prompt remote _other-remotes)
+  remote)
+
+(defvar stp-git-upgrade-always-offer-remote-heads t)
+
+(cl-defgeneric stp-controller-get-git-version (controller prompt pkg-name pkg-alist chosen-remote min-version enforce-min-version)
+  (:documentation
+   "Query CONTROLLER for a new version of a git package."))
+
+(cl-defmethod stp-controller-get-git-version ((_controller stp-interactive-controller) prompt _pkg-name pkg-alist chosen-remote min-version enforce-min-version)
+  (let-alist pkg-alist
+    (let ((extra-versions (and (eq .method 'git)
+                               (or stp-git-upgrade-always-offer-remote-heads
+                                   (eq .update 'unstable))
+                               (stp-git-remote-heads-sorted chosen-remote))))
+      (when (and .branch (member .branch extra-versions))
+        (setq extra-versions (cons .branch (remove .branch extra-versions))))
+      (stp-git-read-version prompt
+                            chosen-remote
+                            :extra-versions extra-versions
+                            :extra-versions-position (if (eq .update 'unstable) 'first 'last)
+                            :branch-to-hash nil
+                            :min-version (and enforce-min-version min-version)))))
+
+(cl-defmethod stp-controller-get-git-version ((controller stp-auto-controller) _prompt pkg-name pkg-alist chosen-remote min-version enforce-min-version)
+  (let ((version (stp-controller-preferred-git-version controller pkg-name pkg-alist chosen-remote min-version)))
+    (stp-enforce-min-version pkg-name version min-version enforce-min-version)
+    version))
+
+(cl-defgeneric stp-controller-get-elpa-version (controller prompt pkg-name pkg-alist chosen-remote min-version enforce-min-version)
+  (:documentation
+   "Query CONTROLLER for the new version of an ELPA package."))
+
+(cl-defmethod stp-controller-get-elpa-version ((_controller stp-interactive-controller) prompt pkg-name _pkg-alist chosen-remote min-version enforce-min-version)
+  (stp-elpa-read-version prompt
+                         pkg-name
+                         chosen-remote
+                         :min-version (and enforce-min-version min-version)))
+
+(cl-defmethod stp-controller-get-elpa-version ((_controller stp-auto-controller) _prompt pkg-name _pkg-alist chosen-remote min-version enforce-min-version)
+  (let ((version (car (stp-elpa-versions-sorted pkg-name chosen-remote))))
+    (stp-enforce-min-version pkg-name version min-version enforce-min-version)
+    version))
+
+(cl-defgeneric stp-operation-verb (operation)
+  "Return a verb that describes OPERATION.")
+
+(cl-defmethod stp-operation-verb ((_operation stp-package-operation))
+  "performing an unknown package operation on")
+
+(cl-defmethod stp-operation-verb ((_operation stp-uninstall-operation))
+  "uninstalling")
+
+(cl-defmethod stp-operation-verb ((_operation stp-install-operation))
+  "installing")
+
+(cl-defmethod stp-operation-verb ((_operation stp-upgrade-operation))
+  "upgrading")
+
+(cl-defmethod stp-operation-verb ((_operation stp-reinstall-operation))
+  "reinstalling")
+
+(cl-defmethod stp-operation-verb ((_operation stp-post-action-operation))
+  "performing post actions on")
+
+(cl-defgeneric stp-ensure-prerequistites (controller operation)
+  (:documentation
+   "Determine if the prerequisites for OPERATION are satisfied."))
+
+(cl-defmethod stp-ensure-prerequistites ((_controller stp-controller) (_operation stp-operation))
+  t)
+
+(cl-defmethod stp-ensure-prerequistites ((_controller stp-controller) (_operation stp-package-change-operation))
+  (stp-maybe-ensure-clean)
+  (cl-call-next-method))
+
+(defun stp-skip-package ()
+  "Skip installing or upgrading this package."
+  (interactive)
+  (throw 'stp-skip 'skip))
+
+(defvar-keymap stp-skip-map
+  "C-c C-k" #'stp-skip-package)
+
+(defmacro stp-allow-skip (skip-form &rest body)
+  (declare (indent 1))
+  (with-gensyms (result)
+    `(cl-flet ((setup-keymap ()
+                 (use-local-map (make-composed-keymap (list stp-skip-map) (current-local-map)))))
+       (let ((,result (minibuffer-with-setup-hook (:append #'setup-keymap)
+                        (catch 'stp-skip
+                          ,@body))))
+         (when (eq ,result 'skip)
+           ,skip-form)
+         ,result))))
+
+(defvar stp-pre-install-functions nil
+  "Abnormal hook run before installing a package.
+
+It is called with the package name and the current options.")
+
+(defvar stp-post-install-functions nil
+  "Abnormal hook run after installing a package.
+
+It is called with the package name and the current options.")
+
+(defvar stp-pre-upgrade-functions nil
+  "Abnormal hook run before upgrading a package.
+
+It is called with the package name and the current options.")
+
+(defvar stp-post-upgrade-functions nil
+  "Abnormal hook run after upgrading a package.
+
+It is called with the package name and the current options.")
+
+(defvar stp-pre-uninstall-functions nil
+  "Abnormal hook run before uninstalling a package.
+
+It is called with the package name and the current options.")
+
+(defvar stp-post-uninstall-functions nil
+  "Abnormal hook run after uninstalling a package.
+
+It is called with the package name and the current options.")
+
+(defvar stp-pre-reinstall-functions nil
+  "Abnormal hook run before reinstalling a package.
+
+It is called with the package name and the current options.")
+
+(defvar stp-post-reinstall-functions nil
+  "Abnormal hook run after reinstalling a package.
+
+It is called with the package name and the current options.")
+
+(defvar stp-pre-action-functions nil
+  "Abnormal hook run before performing an action on a package.
+
+It is called with the package name and the current options.")
+
+(defvar stp-post-action-functions nil
+  "Abnormal hook run after performing an action on a package.
+
+It is called with the package name and the current options.")
+
+(cl-defgeneric stp-operate (controller operation)
+  (:documentation
+   "Perform OPERATION using CONTROLLER. This may result in additional
+operations being added to the controller."))
+
+(cl-defmethod stp-operate ((_controller stp-controller) (_operation stp-operation)))
+
+(cl-defmethod stp-operate :around ((_controller stp-controller) (operation stp-skippable-package-operation))
+  ;; Sometimes, a single repository can contain multiple packages and so
+  ;; installing the dependencies naively will result in multiple copies.
+  (if (oref operation allow-skip)
+      (stp-allow-skip (stp-msg "Skipping %s %s"
+                               (stp-operation-verb operation)
+                               (oref operation pkg-name))
+        (cl-call-next-method))
+    (cl-call-next-method)))
+
+(cl-defgeneric stp-describe (operation))
+
+(cl-defmethod stp-describe ((operation stp-operation))
+  (format "%s %s" (stp-operation-verb operation) (oref operation pkg-name)))
+
+(defun stp-options (controller operation)
+  (or (oref operation options) (oref controller options)))
+
+(cl-defgeneric stp-uninstall-requirements (controller requirements options)
+  (:documentation
+   "Uninstall those REQUIREMENTS that are no longer needed by any
+package and were installed as dependencies."))
+
+(cl-defmethod stp-uninstall-requirements ((controller stp-controller) requirements options)
+  (let* ((to-uninstall (stp-requirements-to-names requirements))
+         (old-to-uninstall t)
+         pkg-name)
+    (while to-uninstall
+      (when (equal to-uninstall old-to-uninstall)
+        (error "Cyclic dependencies encountered while uninstalling packages"))
+      (setq old-to-uninstall (cl-copy-list to-uninstall)
+            pkg-name (stp-symbol-package-name (pop to-uninstall)))
+      ;; Only queue packages for uninstalling when they were installed as
+      ;; dependencies and are no longer required by any package.
+      (when (and (member pkg-name (stp-info-names))
+                 (stp-get-attribute pkg-name 'dependency)
+                 (not (stp-required-by pkg-name)))
+        (stp-controller-prepend-operations
+         controller
+         (stp-uninstall-operation :pkg-name pkg-name
+                                  :options options))))))
+
+;; Skip additive operations that were added due to a dependency that is now
+;; satisfied. This can happen when multiple packages that were installed have
+;; the same dependency.
+(cl-defmethod stp-operate :around ((_controller stp-controller) (operation stp-additive-operation))
+  (with-slots (pkg-name dependency ignorable min-version)
+      operation
+    (if (and dependency
+             ignorable
+             ;; It isn't necessary to search the load path because we just
+             ;; want to know if the package was already installed or
+             ;; upgraded within STP.
+             (stp-package-requirement-satisfied-p pkg-name min-version))
+        'ignore
+      (cl-call-next-method))))
+
+(defvar stp-remove-uninstalled-packages-from-groups t)
+
+(cl-defmethod stp-operate ((controller stp-controller) (operation stp-uninstall-operation))
+  (let ((options (stp-options controller operation)))
+    (with-slots (do-commit do-dependencies)
+        options
+      (with-slots (pkg-name remove-from-groups)
+          operation
+        (run-hook-with-args 'stp-pre-uninstall-functions pkg-name options)
+        (let ((features (stp-headers-directory-features (stp-full-path pkg-name)))
+              (requirements (stp-get-attribute pkg-name 'requirements)))
+          (let-alist (stp-get-alist pkg-name)
+            (if (eql (car (rem-call-process-shell-command (rem-at-end (stp-git-command) "rm" "-r" pkg-name))) 0)
+                (progn
+                  (f-delete pkg-name t)
+                  (stp-delete-alist pkg-name)
+                  ;; Remove this package from all package groups.
+                  (when (and stp-remove-uninstalled-packages-from-groups remove-from-groups)
+                    (cl-dolist (group-name (stp-get-info-group-names))
+                      (stp-set-info-group group-name
+                                          (cl-remove pkg-name
+                                                     (stp-get-info-group group-name)
+                                                     :test #'equal))))
+                  (stp-write-info)
+                  (cl-dolist (feature features)
+                    (push feature stp-headers-uninstalled-features))
+                  (stp-delete-load-path pkg-name)
+                  (let ((msg (format "Uninstalled version %s of %s"
+                                     (stp-abbreviate-remote-version .method .remote .version)
+                                     pkg-name)))
+                    (when (stp-maybe-call do-commit pkg-name options)
+                      (stp-git-commit msg))
+                    (stp-msg msg))
+                  (stp-headers-update-features)
+                  (when (stp-maybe-call do-dependencies pkg-name options)
+                    (stp-uninstall-requirements controller requirements options))
+                  (stp-prune-cached-latest-versions pkg-name))
+              (error "Failed to remove %s. This can happen when there are uncommitted changes in the git repository" pkg-name))))
+        (run-hook-with-args 'stp-post-uninstall-functions pkg-name options)))))
+
+(cl-defgeneric stp-controller-already-installed-or-upgraded-p (controller pkg-name))
+
+(cl-defmethod stp-controller-already-installed-or-upgraded-p ((controller stp-controller) _pkg-name)
+  (cl-find-if (lambda (operation-result)
+                (cl-typep (plist-get operation-result :operation)
+                          '(or stp-install-operation stp-upgrade-operation)))
+              (oref controller history)))
+
+(cl-defgeneric stp-ensure-requirements (controller requirements options)
+  (:documentation
+   "Install or upgrade the REQUIREMENTS that are not currently satisfied."))
+
+(cl-defmethod stp-ensure-requirements ((controller stp-controller) requirements options)
+  (stp-msg "Analyzing the load path for installed packages...")
+  (with-slots (do-always-upgrade-dependencies)
+      options
+    (cl-dolist (requirement requirements)
+      ;; Also allow a list of package names.
+      (dsb (pkg-sym &optional version)
+          (ensure-list requirement)
+        (let* ((ignorable t)
+               (pkg-name (stp-symbol-package-name pkg-sym))
+               (prefix (format "[%s] " pkg-name)))
+          (cond
+           ((string= pkg-name "emacs")
+            (unless (stp-emacs-requirement-satisfied-p pkg-name version)
+              (error "Version %s of Emacs is required but %d.%d is installed"
+                     version
+                     emacs-major-version
+                     emacs-minor-version)))
+           ;; Do nothing when a requirement is ignored or a new enough version
+           ;; is installed unless dependencies should always be upgraded and the
+           ;; package has not already been installed or upgraded.
+           ((and (stp-package-requirement-satisfied-p pkg-name version t)
+                 (or (not (stp-maybe-call do-always-upgrade-dependencies pkg-name options))
+                     ;; Don't upgrade dependencies that aren't STP packages.
+                     ;; This will include dependencies that are actually
+                     ;; included in the main repository of the package (e.g.
+                     ;; helm-core in helm).
+                     (not (member pkg-name (stp-info-names)))
+                     ;; Don't allow skipping the upgrade.
+                     (setq ignorable nil)
+                     ;; Don't upgrade dependencies again if the user has already
+                     ;; upgraded them with this controller.
+                     (stp-controller-already-installed-or-upgraded-p controller pkg-name))))
+           ((not (member pkg-name (stp-info-names)))
+            (stp-controller-prepend-operations
+             controller
+             (stp-install-operation :pkg-name pkg-name
+                                    :options options
+                                    :prompt-prefix prefix
+                                    :min-version version
+                                    :dependency t)))
+           (t
+            ;; The dependency attribute is left as is when upgrading because the
+            ;; package might have been installed manually originally.
+            (stp-controller-prepend-operations
+             controller
+             (stp-upgrade-operation :pkg-name pkg-name
+                                    :options options
+                                    :prompt-prefix prefix
+                                    :ignorable ignorable
+                                    :min-version version
+                                    :dependency t)))))))))
+
+(cl-defmethod stp-operate ((controller stp-controller) (operation stp-install-operation))
+  (let ((options (stp-options controller operation)))
+    (with-slots (do-commit do-audit do-dependencies do-actions)
+        options
+      (with-slots (pkg-name min-version enforce-min-version prompt-prefix dependency)
+          operation
+        (run-hook-with-args 'stp-pre-install-functions pkg-name options)
+        (let* ((pkg-alist (or (oref operation pkg-alist)
+                              (stp-controller-get-package controller pkg-name prompt-prefix min-version enforce-min-version)))
+               (last-hash (stp-git-head)))
+          (let-alist pkg-alist
+            ;; Guess the method if it isn't already known.
+            (unless .method
+              (setq .method (stp-remote-method .remote))
+              (stp-set-attribute pkg-name 'method .method))
+            (when (stp-url-safe-remote-p .remote)
+              (cl-ecase .method
+                (git (stp-git-install controller pkg-name .remote .version .update options :branch .branch))
+                (elpa (stp-elpa-install controller pkg-name .remote .version options))
+                (archive (stp-archive-install controller pkg-name .remote options))
+                (url (stp-url-install controller pkg-name .remote .version options)))
+              (stp-maybe-audit-changes pkg-name 'install last-hash options)
+              (stp-update-remotes pkg-name .remote .remote .other-remotes)
+              (stp-update-requirements pkg-name)
+              (when dependency
+                (stp-set-attribute pkg-name 'dependency t))
+              (stp-write-info)
+              ;; For archives, the version is determined automatically instead of
+              ;; being read and so .version will be nil here.
+              (setq .version (stp-get-attribute pkg-name 'version))
+              (let ((msg (format "Installed version %s of %s"
+                                 (stp-abbreviate-remote-version .method .remote .version)
+                                 pkg-name)))
+                (when (stp-maybe-call do-commit pkg-name options)
+                  (stp-git-commit msg))
+                (stp-msg msg))
+              ;; Features need to be updated before resolving dependencies. For
+              ;; this reason, handling feature updates in a `stp-operate' :after
+              ;; method doesn't work well.
+              (stp-headers-update-features)
+              (when (stp-maybe-call do-dependencies pkg-name options)
+                (stp-ensure-requirements controller (stp-get-attribute pkg-name 'requirements) options))
+              ;; Perform post actions for all packages after everything else.
+              (when (stp-maybe-call do-actions pkg-name options)
+                (stp-controller-append-operations controller (stp-post-action-operation :pkg-name pkg-name :options options))))))
+        (run-hook-with-args 'stp-post-install-functions pkg-name options)))))
+
+(cl-defmethod stp-operate ((controller stp-controller) (operation stp-upgrade-operation))
+  (let ((options (stp-options controller operation)))
+    (with-slots (do-commit do-actions do-dependencies do-audit)
+        options
+      (with-slots (pkg-name min-version enforce-min-version prompt-prefix)
+          operation
+        (run-hook-with-args 'stp-pre-upgrade-functions pkg-name options)
+        (let* ((last-hash (stp-git-head))
+               (pkg-path (stp-canonical-path pkg-name))
+               ;; We use `stp-git-rev-tree' instead of
+               ;; `stp-git-subtree-package-tree' so that it will work even if
+               ;; the package was not installed with git subtree.
+               (tree-hash (stp-git-rev-tree pkg-path "HEAD"))
+               (pkg-alist (stp-get-alist pkg-name))
+               ;; Use a binding for new-version instead of `with-slots' above so
+               ;; that the operation isn't changed when the variable is set.
+               (new-version (oref operation new-version)))
+          (let-alist pkg-alist
+            ;; Automatically determine missing other remotes for archive packages.
+            (when (eq .method 'archive)
+              (setq .other-remotes (cl-set-difference (stp-archives pkg-name) (cons .remote .other-remotes))))
+            (let* ((chosen-remote (stp-controller-get-remote controller "Remote: " .remote .other-remotes))
+                   (prompt (and (not new-version)
+                                (format "Upgrade from %s to version%s: "
+                                        (stp-abbreviate-remote-version .method chosen-remote .version)
+                                        (stp-min-version-annotation min-version enforce-min-version)))))
+              (when (stp-url-safe-remote-p chosen-remote)
+                (unless new-version
+                  (setq new-version
+                        (cl-case .method
+                          (git (stp-controller-get-git-version controller prompt pkg-name pkg-alist chosen-remote min-version enforce-min-version))
+                          (elpa (stp-controller-get-elpa-version controller prompt pkg-name pkg-alist chosen-remote min-version enforce-min-version)))))
+                (cl-ecase .method
+                  (git (stp-git-upgrade controller pkg-name chosen-remote new-version options))
+                  (elpa (stp-elpa-upgrade controller pkg-name chosen-remote new-version options))
+                  (archive (stp-archive-upgrade controller pkg-name chosen-remote options))
+                  (url (stp-url-upgrade controller pkg-name chosen-remote (or new-version (stp-url-read-version prompt)) options)))
+                (setq new-version (stp-get-attribute pkg-name 'version))
+                (let ((trees-equal (stp-git-hash= tree-hash (stp-git-rev-tree pkg-path "HEAD"))))
+                  ;; If the package wasn't changed we don't need to perform
+                  ;; audits, update the package info or update other cached
+                  ;; data. This can happen when the upgrade fails (for example
+                  ;; because the user renamed the git subtree --prefix
+                  ;; directory) and a reinstall is required. See
+                  ;; `stp-git-upgrade'.
+                  (unless (and trees-equal
+                               ;; The new version needs to be compared with the
+                               ;; old one in addition to comparing the git trees
+                               ;; since there could be an empty commit.
+                               ;;
+                               ;; The result of the `stp-get-attribute' call can
+                               ;; be different from .version because the
+                               ;; 'version attribute will have changed after the
+                               ;; call to `stp-git-upgrade', `stp-elpa-upgrade',
+                               ;; `stp-archive-upgrade' or `stp-url-upgrade' if
+                               ;; it was successful.
+                               (string= .version new-version))
+                    (unless trees-equal
+                      (stp-maybe-audit-changes pkg-name 'upgrade last-hash options))
+                    (stp-update-remotes pkg-name chosen-remote .remote .other-remotes)
+                    (unless trees-equal
+                      (stp-update-requirements pkg-name))
+                    (stp-write-info)
+                    ;; Don't commit, push or perform push actions until the user
+                    ;; resolves any merge conflicts.
+                    (stp-upgrade-handle-merge-conflicts)
+                    ;; We should still commit when the trees are the same
+                    ;; because the package info might have changed when if there
+                    ;; are empty commits.
+                    (let ((msg (format "Upgraded to version %s of %s"
+                                       (stp-abbreviate-remote-version .method chosen-remote new-version)
+                                       pkg-name)))
+                      (when (stp-maybe-call do-commit pkg-name options)
+                        (stp-git-commit msg))
+                      (stp-msg msg))
+                    (unless trees-equal
+                      (stp-headers-update-features)
+                      (when (stp-maybe-call do-dependencies pkg-name options)
+                        (stp-ensure-requirements controller (stp-get-attribute pkg-name 'requirements) options)))
+                    ;; Perform post actions for all packages after everything
+                    ;; else.
+                    (when (and (not trees-equal)
+                               (stp-maybe-call do-actions pkg-name options))
+                      (stp-controller-append-operations controller (stp-post-action-operation :pkg-name pkg-name :options options)))))))))
+        (run-hook-with-args 'stp-post-upgrade-functions pkg-name options)))))
+
+(cl-defmethod stp-operate ((controller stp-controller) (operation stp-install-or-upgrade-operation))
+  (let ((class (if (member (oref operation pkg-name) (stp-info-names))
+                   'stp-upgrade-operation
+                 'stp-install-operation)))
+    (stp-controller-prepend-operations controller (clone (rem-change-class operation class) :reportable t))))
+
+(cl-defmethod stp-operate ((controller stp-controller) (operation stp-reinstall-operation))
+  (let ((options (stp-options controller operation)))
+    (with-slots (pkg-name new-version reportable)
+        operation
+      (run-hook-with-args 'stp-pre-reinstall-functions pkg-name options)
+      (when (and (stp-git-tree-package-modified-p pkg-name)
+                 (not (yes-or-no-p (format "The package %s has been modified since the last commit in the working tree. Reinstalling will delete these changes. Do you wish to proceed?" pkg-name))))
+        (user-error "Reinstall aborted"))
+      (let-alist (stp-get-alist pkg-name)
+        (let* ((pkg-alist (stp-get-alist pkg-name))
+               (tree-hashes (and (if (eq .method 'git)
+                                     (stp-git-subtree-package-modified-p pkg-name .remote .version)
+                                   ;; For methods other than 'git, we need to create
+                                   ;; a synthetic git repository for comparision
+                                   ;; purposes.
+                                   (stp-git-subtree-package-modified-p pkg-name (stp-git-download-as-synthetic-repo pkg-name (stp-download-url pkg-name pkg-alist)) "HEAD")))))
+          ;; Warn the user about reinstalling if there are modifications to the
+          ;; subtree that were not the result of git subtree merge as this will
+          ;; result in the loss of their customizations to the package.
+          (save-window-excursion
+            (when (and tree-hashes
+                       (unwind-protect
+                           ;; curr-hash is the hash of the most recent version of
+                           ;; the subtree (which may include user modifications).
+                           ;; last-hash is the hash of the last subtree that was
+                           ;; merged (e.g. by installing or upgrading the package).
+                           (and (dsb (curr-hash last-hash)
+                                    tree-hashes
+                                  (stp-git-show-diff (list last-hash curr-hash))
+                                  t)
+                                (not (yes-or-no-p (format "The package %s has been modified locally. Reinstalling will delete these changes. Do you wish to proceed?" pkg-name))))
+                         (stp-git-bury-diff-buffer)))
+              (user-error "Reinstall aborted")))
+          (when new-version
+            (setf pkg-alist (copy-tree pkg-alist)
+                  (map-elt pkg-alist 'version) new-version))
+          (stp-controller-prepend-operations
+           controller
+           ;; Reinstalling will fail if the uninstall operation does not commit.
+           ;; Don't remove the package from package groups if it is being
+           ;; reinstalled.
+           (stp-uninstall-operation :pkg-name pkg-name :options (clone options :do-commit t) :reportable reportable :remove-from-groups nil)
+           (stp-install-operation :pkg-name pkg-name :options options :pkg-alist pkg-alist :reportable reportable))))
+      (run-hook-with-args 'stp-post-reinstall-functions pkg-name options))))
+
+(cl-defmethod stp-operate ((controller stp-controller) (operation stp-post-action-operation))
+  (let ((options (stp-options controller operation)))
+    (with-slots (pkg-name)
+        operation
+      (run-hook-with-args 'stp-pre-action-functions pkg-name options)
+      (stp-post-actions pkg-name options)
+      (run-hook-with-args 'stp-post-action-functions pkg-name options))))
+
+(cl-defgeneric stp-report-operations (controller))
+
+(cl-defmethod stp-report-operations ((controller stp-controller))
+  (cl-labels ((breakdown (operations word)
+                (let ((counts (make-hash-table :test #'equal))
+                      (verb-operations (make-hash-table :test #'equal))
+                      verbs)
+                  (cl-dolist (operation operations)
+                    (let ((verb (stp-operation-verb (plist-get operation :operation))))
+                      (setf (gethash verb verb-operations)
+                            (cons operation (gethash verb verb-operations)))
+                      (cl-incf (gethash verb counts 0))
+                      (push verb verbs)))
+                  (setq verbs (-sort #'string< (-uniq verbs)))
+                  (s-join "\n" (mapcar (lambda (verb)
+                                         (format "%s %d packages%s %s"
+                                                 (s-capitalize verb)
+                                                 (gethash verb counts)
+                                                 (if (> (gethash verb counts) 1)
+                                                     (format " (%s)" (operations-string (gethash verb verb-operations)))
+                                                   "")
+                                                 word))
+                                       verbs))))
+              (operations-string (operations)
+                (rem-join-and (mapcar (fn (oref (plist-get % :operation) pkg-name))
+                                      operations)))
+              (reportable-only (operations)
+                (-filter (-compose #'stp-reportable
+                                   (-rpartial #'plist-get :operation))
+                         operations)))
+    (let* ((successful-operations (stp-controller-filter-history controller 'succeed))
+           (skipped-operations (stp-controller-filter-history controller 'skip))
+           (failed-operations (stp-controller-filter-history controller 'fail))
+           (total (+ (length successful-operations)
+                     (length skipped-operations)
+                     (length failed-operations))))
+      ;; Filter out non-reportable operations.
+      (setq successful-operations (reportable-only successful-operations)
+            skipped-operations (reportable-only skipped-operations)
+            failed-operations (reportable-only failed-operations))
+      (when successful-operations
+        (stp-msg "Successfully completed %d operations:\n%s"
+                 (length successful-operations)
+                 (breakdown successful-operations "succeeded")))
+      (when failed-operations
+        (stp-msg "%d/%d operations failed:\n%s"
+                 (length failed-operations)
+                 total
+                 (breakdown failed-operations "failed"))
+        (cl-dolist (operation-result failed-operations)
+          (dsb (&key operation err &allow-other-keys)
+              operation-result
+            (stp-msg "%s failed: %s" (s-capitalize (stp-describe operation)) err)))
+        (display-buffer stp-log-buffer-name)))))
+
+(defvar stp-ignore-redundant-upgrades t
+  "When non-nil, ignore errors that occur when an upgrade is redundant.
+
+Such errors occur when the same version that the user attempted
+to upgrade to is already installed. These errors will still be
+logged. The value can also be a function that takes no arguments
+similar to `stp-auto-commit'.
+
+By default, redundant errors are ignored when the command run is
+`stp-install-or-upgrade-package-group-command'.")
+
+(cl-defgeneric stp-execute (controller)
+  (:documentation
+   "Execute the operations for CONTROLLER."))
+
+(cl-defmethod stp-execute ((controller stp-controller))
+  "Execute the operations stored in the operations slot of CONTROLLER."
+  (with-slots (options operations history)
+      controller
+    (with-slots (do-push do-lock do-reset)
+        options
+      (let ((last-hash (stp-git-head))
+            operation)
+        ;; Preserve order when there is already some history.
+        (setf history (reverse history))
+        (while (setq operation (pop operations))
+          (condition-case err
+              (let ((status (stp-operate controller operation)))
+                (stp-ensure-prerequistites controller operation)
+                (unless (memq status '(skip ignore))
+                  (setq status 'succeed))
+                (push (list :operation operation :status status) history))
+            (stp-redundant-upgrade-error
+             (if (stp-maybe-call stp-ignore-redundant-upgrades (oref operation pkg-name) (stp-options controller operation))
+                 (progn
+                   (stp-msg "Skipping upgrade: %s" (cadr err))
+                   (push (list :operation operation :status 'ignore :err err) history))
+               (push (list :operation operation :status 'fail :err err) history)))
+            (error (push (list :operation operation :status 'fail :err err) history))))
+        (setf history (reverse history))
+        ;; Resetting should be done before pushing or locking if an error occurred.
+        (let ((failed-operations (stp-controller-filter-history controller 'fail))
+              (reset (stp-maybe-call do-reset)))
+          (when (and failed-operations (or (eq reset t) (memq :error reset)))
+            (stp-msg "Resetting due to %s"
+                     (if (cdr failed-operations)
+                         "errors"
+                       "an error"))
+            (stp-git-reset last-hash :mode 'hard)))
+        (when (stp-maybe-call do-push)
+          (stp-git-push))
+        (when (stp-maybe-call do-lock)
+          (stp-update-lock-file))
+        (stp-report-operations controller)))))
+
+(defun stp-execute-operations (operations options &rest args)
+  (stp-execute (apply #'stp-make-controller options :operations operations args)))
+
+(provide 'stp-controller)
+
+;; Local Variables:
+;; read-symbol-shorthands: (
+;;   ("dsb" . "cl-destructuring-bind")
+;;   ("mvb" . "cl-multiple-value-bind")
+;;   ("mvs" . "cl-multiple-value-setq")
+;;   ("with-gensyms" . "cl-with-gensyms")
+;;   ("once-only" . "cl-once-only")
+;;   ("dflet" . "noflet")
+;;   ("plet" . "pcase-let")
+;;   ("plet*" . "pcase-let*")
+;;   ("psetq*" . "pcase-setq")
+;;   ("pdolist" . "pcase-dolist")
+;;   ("plambda" . "pcase-lambda")
+;;   ("pdefmacro" . "pcase-defmacro")
+;;   ("epcase" . "pcase-exhaustive")
+;;   ("fn" . "rem-fn")
+;;   ("fn1" . "rem-fn1")
+;;   ("fn2" . "rem-fn2")
+;;   ("fn3" . "rem-fn3")
+;;   ("fn4" . "rem-fn4")
+;;   ("fn5" . "rem-fn5")
+;;   ("fn6" . "rem-fn6")
+;;   ("fn7" . "rem-fn7")
+;;   ("fn8" . "rem-fn8")
+;;   ("fn9" . "rem-fn9")
+;;   ("fn10" . "rem-fn10"))
+;; End:
+;;; stp-controller.el ends here
