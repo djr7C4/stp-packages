@@ -1,0 +1,988 @@
+;;; stp-git-utils.el --- Git utility functions -*- lexical-binding: t; -*-
+
+;;; Code:
+
+(require 'f)
+(require 's)
+(require 'stp-bootstrap)
+(require 'stp-utils)
+(require 'timer)
+
+(cl-defun stp-git-root (&key path (transform #'f-canonical))
+  "Return the absolute path to the git repository containing PATH.
+
+TRANSFORM is a function that is applied to PATH when it is non-nil."
+  (setq path (or (and path (funcall transform path)) default-directory))
+  (let* ((default-directory path)
+         (root (or (rem-run-command (append (stp-git-command) '("rev-parse" "--show-toplevel")))
+                   ;; Fallback for git repositories without working trees (e.g.
+                   ;; those created with git clone --bare).
+                   (rem-run-command (append (stp-git-command) '("rev-parse" "--resolve-git-dir" "."))))))
+    (and (> (length root) 0)
+         (f-dir-p root)
+         (f-slash (f-canonical root)))))
+
+(defun stp-git-relative-path (path)
+  "Return PATH relative to the git root."
+  (rem-relative-path path (stp-git-root)))
+
+(defmacro stp-with-git-root (&rest body)
+  "Execute BODY in the git root for `stp-source-directory'."
+  (declare (indent 0))
+  `(let ((default-directory (stp-git-root :path stp-source-directory)))
+     ,@body))
+
+(def-edebug-spec stp-with-git-root t)
+
+(defun stp-relative-path (pkg-name &optional top-level)
+  "Return the path to PKG-NAME relative to `stp-source-directory'.
+
+The return value always ends with a slash. If TOP-LEVEL is
+non-nil, make the path relative to the root of the git repository
+instead."
+  (rem-slash (if top-level
+                 (let ((path (f-join stp-source-directory pkg-name)))
+                   (s-chop-prefix (rem-slash (f-full (stp-git-root :path path)))
+                                  (f-full path)))
+               pkg-name)))
+
+;; This is bound to t in `stp-latest-version' which uses bare repositories for
+;; internal caching. The value being non-nil means that the user is allowed to
+;; specify that safe.bareRepository can be overridden. This allows the program
+;; to avoid allowing bare repositories in places where it is not required in
+;; order to enhance security.
+(defvar stp-allow-bare-repository-override nil)
+
+;; The user should set this depending of if they want to allow commands that
+;; require it to override safe.bareRepository. This is only done in top-level
+;; git repositories so the security issues described at
+;; https://github.com/justinsteven/advisories/blob/main/2022_git_buried_bare_repos_and_fsmonitor_various_abuses.md
+;; shouldn't be possible even when it is non-nil. Some functionality will not
+;; work when
+(defvar stp-override-bare-repository nil
+  "Allow safe git commands to run regardless of safe.bareRepository.
+
+When safe.bareRepository is set to explicit in .gitconfig, some
+features such as latest version commands will not work unless
+this variable is non-nil. Even when enabled, safe.bareRepository
+is only overridden for bare repositories at specific paths for
+security.")
+
+(defun stp-git-flags ()
+  (when (and stp-allow-bare-repository-override stp-override-bare-repository)
+    '("-c" "safe.bareRepository=all")))
+
+(defun stp-git-command ()
+  (append (list "git") (stp-git-flags)))
+
+(defun stp-current-package ()
+  "Return the name of the package and the relative path to the current file."
+  (stp-refresh-info)
+  (let ((path (or (buffer-file-name (or (buffer-base-buffer)
+                                        (current-buffer)))
+                  default-directory)))
+    (awhen (->> (stp-info-names)
+                (mapcar (lambda (pkg-name)
+                          (list pkg-name
+                                (->> path
+                                     (s-matched-positions-all (regexp-quote (concat "/" (stp-relative-path pkg-name))))
+                                     last
+                                     caar))))
+                (cl-find-if #'cadr))
+      (dsb (pkg-name k)
+          it
+      (list pkg-name (apply #'f-join (cddr (f-split (substring path k)))))))))
+
+(defun stp-git-tracked-p (path)
+  "Determine if the file at PATH in a git repository is tracked."
+  ;; This is needed to handle the case when path is a file in
+  ;; `default-directory'. Without this, (f-dirname path) would be "./" which
+  ;; will lead to the file not being found by git ls-files.
+  (setq path (f-full path))
+  (let* ((dir (f-dirname path))
+         (file (f-relative path dir)))
+    (unless (stp-git-root :path dir)
+      (error "Not in a git repository"))
+    (let* ((default-directory dir)
+           (cmd (rem-at-end (stp-git-command) "ls-files" "--error-unmatch" file)))
+      ;; `rem-call-process-shell-command' is more efficient than
+      ;; `call-process-shell-command' because it does not load the shell's init
+      ;; files.
+      (eql (car (rem-call-process-shell-command cmd)) 0))))
+
+(defun stp-git-remotes ()
+  (--> (rem-run-command (append (stp-git-command) '("remote" "-v")) :error t)
+       (s-split rem-newline-char-regexp it t)
+       (mapcar (fn (-take 2 (s-split rem-positive-whitespace-regexp % t))) it)
+       (mapcar (-partial #'apply #'cons) it)
+       -uniq))
+
+(stp-defmemoized stp-git-valid-remote-p (remote)
+  "Determine if REMOTE is a valid git repository."
+  (and (stringp remote)
+       (let ((cmd (rem-at-end (stp-git-command) "ls-remote" "-h" remote)))
+         (eql (car (rem-call-process-shell-command cmd)) 0))))
+
+(cl-defun stp-git-valid-remote-ref-p (remote rev &key ask-p (memoize t))
+  "Check if REV is a ref or a hash for a ref on REMOTE."
+  (and (or (member rev (stp-git-remote-tags remote t :memoize memoize))
+           (member rev (stp-git-remote-heads remote :memoize memoize))
+           ;; There is no way to check if hash exists on a remote (only refs) so
+           ;; we ask the user.
+           (and ask-p
+                (yes-or-no-p (format "%s was not found in %s (this is normal for hashes). Continue?" rev remote))))
+       t))
+
+(stp-defmemoized stp-git-valid-rev-p (path rev)
+  "Check if REV is a valid git revision at the local PATH."
+  (let* ((default-directory path)
+         (cmd (rem-at-end (stp-git-command) "rev-parse" "--verify" rev)))
+    (eql (car (rem-call-process-shell-command cmd)) 0)))
+
+(defun stp-git-init (path)
+  "Run \"git init\" on PATH."
+  (let* ((default-directory path)
+         (cmd (rem-at-end (stp-git-command) "init")))
+    (unless (stp-git-root)
+      (unless (eql (car (rem-call-process-shell-command cmd)) 0)
+        (error "The command \"git init\" failed")))))
+
+(cl-defun stp-git-add (path &key force update)
+  "Run \"git add\" on PATH.
+
+When FORCE is non-nil, the file will be added even if it is
+ignored. When UPDATE is non-nil, only add changes to tracked
+files."
+  (dsb (dir target)
+      (if (f-dir-p path)
+          ;; This allows path to be the top-level of a git repository.
+          (list path ".")
+        (list (f-dirname path) (f-filename path)))
+    (let ((default-directory (f-full dir)))
+      (rem-run-command (append (stp-git-command)
+                               '("add")
+                               (list target)
+                               (rem-maybe-args "-u" update "-f" force))
+                       :error t))))
+
+(defvar stp-git-synthetic-repos nil)
+
+(stp-defmemoized stp-git-download-as-synthetic-repo (pkg-name remote)
+  "Create a new git synthetic repository for PKG-NAME.
+
+This is done by downloading REMOTE and adding it to the
+repository. Return the path to the repository."
+  (let (success
+        (dir (make-temp-file pkg-name t)))
+    (unwind-protect
+        (progn
+          (stp-download-elisp dir pkg-name remote)
+          (stp-git-init dir)
+          (stp-git-add dir)
+          (let ((default-directory dir))
+            (stp-git-commit ""))
+          (setq success t))
+      (unless success
+        (f-delete dir t)))
+    (push dir stp-git-synthetic-repos)
+    dir))
+
+(cl-defun stp-git-ensure-branch (&optional allow-detached)
+  (unless (or allow-detached (stp-git-current-branch))
+    (error "Refusing to commit because HEAD is detached")))
+
+(cl-defun stp-git-commit (msg &key amend allow-detached)
+  (stp-git-ensure-branch allow-detached)
+  (when (stp-git-merge-conflict-p)
+    (error "Committing is not possible due to %s"
+           (if (> (length (stp-git-conflicted-files)) 1)
+               "merge conflicts"
+             "a merge conflict")))
+  (if (stp-git-clean-p)
+      (stp-msg "There are no changes to commit. Skipping...")
+    (rem-run-command (append (stp-git-command)
+                             (list "commit" "--allow-empty-message")
+                             ;; Don't specify a message when it is nil. This
+                             ;; is mainly useful when amending.
+                             (if msg
+                                 (list "-am" msg)
+                               (list "-C" "HEAD"))
+                             (rem-maybe-args "--amend" amend))
+                     :error t)))
+
+(defvar stp-subtree-fetch t
+  "This allows hashes to be resolved when installing or upgrading.")
+
+(cl-defun stp-git-fetch (remote &key force refspec no-new-tags)
+  "Fetch from REMOTE.
+
+When FORCE is non-nil, pass the --force flag to git fetch.
+
+When REFSPEC is non-nil, pass it to git fetch as the refspec
+argument (see the manpage).
+
+When NO-NEW-TAGS is non-nil, download the tags objects but remove
+the references to them in .git/refs/tags. Otherwise, the refs
+will become cluttered with tags for remotes of packages. These
+tags won't have a clear meaning on the local repository unless it
+is for this specific package. For example, there could be a
+v2.0.0 tag for chatgpt-shell but v2.0.0 doesn't have much meaning
+without even knowing which package it is for. Git doesn't seem to
+provide a way to do this so we copy .git/refs/tags beforehand and
+then restore it after the fetch."
+  (let* ((git-root (stp-git-root))
+         (tags-dir-tmp (and no-new-tags (make-temp-file "git-tags" t)))
+         (tags-dir (or (car (-filter #'f-dir-p (list (f-join git-root ".git/refs/tags")
+                                                     ;; Handle bare repositories.
+                                                     (f-join git-root "refs/tags"))))
+                       (error "No tags directory found at %s" git-root))))
+    (unwind-protect
+        (let ((cmd (append (stp-git-command)
+                           '("fetch" "--atomic" "--tags")
+                           (and force (list "--force"))
+                           (list remote)
+                           (and refspec (list refspec)))))
+          (when (and no-new-tags tags-dir)
+            ;; Backup all tags.
+            (cl-dolist (path (f-entries tags-dir))
+              (f-move path (f-join tags-dir-tmp (f-relative path tags-dir))))
+            (f-delete tags-dir t))
+          (rem-run-command cmd :error t)
+          (when (and no-new-tags tags-dir)
+            (f-delete tags-dir t)
+            (f-move tags-dir-tmp tags-dir)))
+      (when no-new-tags
+        (f-delete tags-dir-tmp t)))))
+
+(defvar stp-subtree-fetch t
+  "This allows hashes to be resolved when installing or upgrading.")
+
+(cl-defun stp-git-maybe-fetch (remote version &key force refspec no-new-tags (memoize t))
+  (when (and stp-subtree-fetch
+             (not (stp-git-valid-remote-ref-p remote version :memoize memoize)))
+    (stp-git-fetch remote :force force :refspec refspec :no-new-tags no-new-tags)
+    t))
+
+(cl-defun stp-git-push (&key all tags)
+  (if (or all tags (stp-git-unpushed-p))
+      (progn
+        (rem-run-command (append (stp-git-command)
+                                 '("push")
+                                 (rem-maybe-args "--all" all))
+                         :error t)
+        ;; When the --tags argument is used, only tags are pushed so this is
+        ;; done as a separate command.
+        (when tags
+          (rem-run-command (append (stp-git-command) '("push" "--tags")) :error t)))
+    (stp-msg "There is nothing to push. Skipping...")))
+
+;; This is a higher-level function than `stp-git-commit' and `stp-git-push'.
+;; Unlike those functions, it calls do-commit and do-push as needed.
+(cl-defun stp-git-commit-push (name msg options &key all tags)
+  (when (stp-maybe-call (oref options do-commit) name options)
+    (stp-git-commit msg)
+    ;; Pushing does not make sense if we did not commit earlier.
+    (stp-git-push :all all :tags tags)))
+
+(cl-defun stp-git-reset (revision &key mode)
+  (let* ((mode-flags '((soft . "--soft")
+                       (mixed . "--mixed")
+                       (hard . "--hard")))
+         (mode-flag (and mode
+                         (or (map-elt mode-flags mode)
+                             (error "The mode must be in %S" mode-flags)))))
+    (rem-run-command (append (stp-git-command)
+                             (list "reset")
+                             (rem-maybe-args mode-flag mode-flag)
+                             (list revision)))))
+
+(defun stp-git-tag (tag revision)
+  "Create TAG at REVISION."
+  (rem-run-command (append (stp-git-command) (list "tag" tag revision)) :error t))
+
+(cl-defun stp-git-status (&key keep-ignored keep-untracked)
+  "Return a list of the status of each file in the repository.
+
+Each status is a list containing three or four elements. The
+first element is the character status code for the index used in
+version 1 of the git porcelain format (see the manual for
+git-status) and the second element is the character status code
+for the worktree. The third is the file name. When a file is
+renamed or copied, there is also a fourth element that indicates
+the new name.
+
+When KEEP-IGNORED is non-nil, include ignored files in the
+results. When KEEP-UNTRACKED is non-nil, include untracked files
+in the results."
+  (let ((output (rem-run-command (append (stp-git-command) '("status" "--porcelain")) :error t)))
+    (cl-remove-if (lambda (status)
+                    (dsb (index-status worktree-status &rest args)
+                        status
+                      (and (string= index-status worktree-status)
+                           (member index-status
+                                   (append (and (not keep-ignored) (list "!"))
+                                           (and (not keep-untracked) (list "?")))))))
+                  (mapcar (lambda (line)
+                            ;; The first two characters can be spaces which have
+                            ;; a specific meaning and should not be used to
+                            ;; split the strings.
+                            (cl-list* (substring line 0 1)
+                                      (substring line 1 2)
+                                      (and (mapcar #'s-trim (s-split "->" (substring line 2))))))
+                          (s-split "\n" output t)))))
+
+(defun stp-git-clean-p ()
+  "Determine if the git repository has uncommitted changes."
+  (and (not (stp-git-status)) t))
+
+(defun stp-git-unpushed-p ()
+  (let* ((branch (stp-git-current-branch))
+         (upstream (stp-git-upstream-branch)))
+    (and branch
+         upstream
+         (not (string= (rem-run-command (append (stp-git-command) (list "cherry" upstream branch)) :error t) "")))))
+
+(defun stp-git-conflicted-files ()
+  "Return the list of files with merge conflicts."
+  (->> (stp-git-status)
+       (-filter (lambda (status)
+                  (dsb (index-status worktree-status &rest args)
+                      status
+                    ;; See the description of porcelain format version 1 in
+                    ;; manual for git-status.
+                    (or (string= index-status "U")
+                        (string= worktree-status "U")
+                        (and (string= index-status worktree-status)
+                             (member index-status '("A" "D")))))))
+       (mapcar #'caddr)))
+
+(defun stp-git-merge-conflict-p ()
+  "Determine if there are unmerged changes."
+  (and (stp-git-conflicted-files) t))
+
+(defun stp-git-modified-files ()
+  (mapcar (lambda (entry) (caddr entry)) (stp-git-status)))
+
+(defun stp-git-tree-modified-p (path)
+  "Determine if any files in PATH have been modified since the last commit."
+  (setq path (f-canonical path))
+  (let ((default-directory (stp-git-root :path path)))
+    (cl-some (lambda (file)
+               (setq file (f-canonical file))
+               (or (f-same-p path file)
+                   (f-ancestor-of-p path file)))
+             (stp-git-modified-files))))
+
+(defun stp-git-upstream-branch (&optional branch)
+  "Get the upstream branch of BRANCH if it exists.
+
+Otherwise, return nil. BRANCH defualts to the current branch."
+  (setq branch (or branch ""))
+  (rem-run-command (append (stp-git-command) (list "rev-parse" "--abbrev-ref" (format "%s@{upstream}" branch)))))
+
+;; Based on `magit-get-current-branch'.
+(defun stp-git-current-branch ()
+  "Return the current branch or nil if HEAD is detached."
+  (rem-run-command (append (stp-git-command) '("symbolic-ref" "--short" "HEAD"))))
+
+;; Based on `magit-get-push-remote'.
+(defun stp-git-push-target (&optional branch)
+  (setq branch (or branch (stp-git-current-branch)))
+  ;; git config --get returns a non-zero exit status when the value does not
+  ;; exist. This will result in `rem-run-command' returning nil.
+  (let ((push-default (rem-run-command (append (stp-git-command) '("config" "--get" "remote.pushDefault")))))
+    (or push-default
+        (let ((push-remote (rem-run-command (append (stp-git-command) (list "config" "--get" (s-join "." (list "branch" branch "pushRemote")))))))
+          (when (equal push-remote "")
+            (setq push-remote nil))
+          push-remote))))
+
+(defun stp-git-remote-url (remote)
+  "Get the URL for REMOTE."
+  (rem-run-command (append (stp-git-command) (list "remote" "get-url" remote)) :error t))
+
+(defvar stp-git-abbreviated-hash-length 7)
+
+(defun stp-git-abbreviate-hash (hash)
+  (s-left stp-git-abbreviated-hash-length hash))
+
+(stp-defmemoized stp-git-tree (path &optional rev)
+  "Determine the hash of the git tree at PATH for revision REV.
+
+If there is no git tree at PATH then nil will be returned. PATH
+is the directory to check. REV is the revision to use and
+defaults to HEAD."
+  (unless (f-dir-p path)
+    (error "The directory %s does not exist" path))
+  (setq path (f-canonical path)
+        rev (or rev "HEAD"))
+  (let* ((default-directory (stp-git-root :path path))
+         ;; Git will show the children of the directory even when -d is
+         ;; specified when the directory ends with a slash.
+         (rel-path (rem-no-slash (stp-git-relative-path path))))
+    (when (f-same-p default-directory rel-path)
+      (error "Cannot determine the hash of the top-level git repository"))
+    (let ((output (rem-run-command (append (stp-git-command) (list "ls-tree" "-d" rev "--object-only" rel-path)) :error t)))
+      (and (not (string= output "")) output))))
+
+(defun stp-git-tree-paths (path &optional rev)
+  "Compute the paths for the contents of the git tree at PATH.
+
+This is done for revision REV when it is non-nil."
+  (unless (f-dir-p path)
+    (error "The directory %s does not exist" path))
+  (setq path (f-canonical path)
+        rev (or rev "HEAD"))
+  (let* ((default-directory (stp-git-root :path path))
+         (rel-path (stp-git-relative-path path))
+         (cmd (append (stp-git-command) (list "ls-tree" "-r" rev "--name-only" rel-path))))
+    (s-split "\n" (rem-run-command cmd :error t) t)))
+
+(defun stp-git-subtree-commit-message (path &optional format)
+  "Return the message for the last local commit by git subtree at PATH.
+
+This is different from the remote commit that was merged when
+--squash is used. FORMAT is passed to the --format argument of
+git log."
+  (unless (f-dir-p path)
+    (error "The directory %s does not exist" path))
+  (let* ((default-directory path)
+         (rel-path (rem-no-slash (rem-relative-path path (stp-git-root))))
+         (grep-target (format "^[ \t]*git-subtree-dir:[ \t]*%s[ \t]*$" rel-path))
+         (cmd (append (stp-git-command)
+                      (list "log" "--grep" grep-target "-n" "1")
+                      (and format (list (format "--format=%s" format))))))
+    (rem-run-command cmd)))
+
+(defun stp-git-subtree-commit (path)
+  "Get the last remote commit merged into the subtree at PATH."
+  (let ((output (rem-empty-nil (stp-git-subtree-commit-message path) #'s-trim)))
+    (and output
+         (save-match-data
+           (string-match "^[ \t]*git-subtree-split:[ \t]*\\([A-Fa-f0-9]+\\)[ \t]*" output)
+           (match-string 1 output)))))
+
+(defun stp-git-subtree-tree (path)
+  "Get the last git tree merged into the subtree at PATH."
+  (rem-empty-nil (stp-git-subtree-commit-message path "%T") #'s-trim))
+
+(defun stp-git-rev-parse (path rev)
+  (let ((default-directory path))
+    (rem-run-command (append (stp-git-command) (list "rev-parse" rev)))))
+
+(defun stp-git-rev-tree (path rev)
+  "Get the git tree associated with REV in the repository at PATH."
+  (stp-git-rev-parse path (format "%s^{tree}" rev)))
+
+(defun stp-git-subtree-modified-p (path &optional remote rev)
+  "Test if the git subtree at PATH has been modified by the user.
+
+This means outside of changes made by git subtree add and merge
+commands. Return a list containing the hash of the current tree
+and the hash of the tree that was installed. If REMOTE and REV
+are provided then they will be used to compute the hash for the
+subtree in the event that it cannot be determined from git log.
+This occurs for example when the subtree was not actually
+installed as a git subtree."
+  (let ((tree (or (stp-git-tree path)
+                  (error "Unable to find the git tree for %s" path)))
+        (last-tree (or (stp-git-subtree-tree path)
+                       (and remote
+                            rev
+                            ;; This is slower but should work even when the
+                            ;; subtree was not installed using git subtree add.
+                            ;; It compares the actual git tree (and by extension
+                            ;; their contents since trees with differing
+                            ;; contents) will have different hashes.
+                            (progn
+                              (stp-git-fetch remote :no-new-tags t)
+                              ;; Some revisions (e.g. tags) won't be available
+                              ;; locally even after a fetch since we used
+                              ;; :no-new-tags t. We convert them to hashes to
+                              ;; avoid issues. If we didn't supply :no-new-tags
+                              ;; t existing tags with the same name might get
+                              ;; clobbered.
+                              (stp-git-rev-tree path (stp-git-remote-rev-to-hash remote rev))))
+                       (error "Unable to find the merged git subtree"))))
+    (and (not (string= tree last-tree))
+         (list tree last-tree))))
+
+(defun stp-git-subtree-p (path)
+  (and (stp-git-subtree-commit path) t))
+
+(defun stp-git-head (&optional path)
+  "Resolve HEAD for the git repository at PATH."
+  ;; This version is not used because it is memoized. The local HEAD can change
+  ;; as packaging operations are run so memoizing it is undesirable.
+  ;; (stp-git-remote-head (stp-git-root :path (or path stp-source-directory)))
+  (stp-git-rev-parse (or path default-directory) "HEAD"))
+
+(defun stp-git-diff (&optional hashes)
+  (rem-run-command (append (stp-git-command) (cl-list* "diff" hashes)) :error t))
+
+(defvar stp-git-diff-buffer-name "*STP Git Diff*")
+
+(defun stp-git-show-diff (&optional hashes)
+  "Display the differences between HASHES to the user.
+
+Several forms of HASHES are supported:
+\(HASH NEW-HASH): shows the changes from HASH to NEW-HASH
+\(hash): show the changes from HASH to the index
+nil: show the changes from the index to the working tree"
+  (let ((buf (get-buffer-create stp-git-diff-buffer-name))
+        (diff (stp-git-diff hashes)))
+    (with-current-buffer buf
+      (read-only-mode 0)
+      (erase-buffer)
+      (insert diff)
+      (goto-char (point-min))
+      (read-only-mode 1)
+      (diff-mode))
+    (display-buffer buf)))
+
+(defun stp-git-bury-diff-buffer ()
+  (when-let* ((buf (get-buffer stp-git-diff-buffer-name))
+              (win (get-buffer-window buf t)))
+    (with-selected-window win
+      ;; Due to the quirks of `bury-buffer', it doesn't stop displaying the
+      ;; buffer in the window unless the window is selected and the buffer is
+      ;; *not* passed as an argument.
+      (bury-buffer)))
+  (redisplay))
+
+(defun stp-git-remote-hash-alist-basic (remote)
+  (rem-run-command (append (stp-git-command) (list "ls-remote" remote)) :error t :nostderr t))
+
+(stp-defmemoized stp-git-remote-hash-alist-memoized (remote)
+  (stp-git-remote-hash-alist-basic remote))
+
+(cl-defun stp-git-remote-hash-alist (remote &key (prefixes nil prefixes-supplied-p) (memoize t))
+  "Return an alist that maps hashes to refs for REMOTE.
+
+If supplied, PREFIXES is a list of allowed prefixes. Matching
+prefixes are removed from the refs. By default all refs are
+returned. If MEMOIZE is nil, git commands called by function will
+not be memoized even within an `stp-with-memoization' form."
+  ;; This function should not be passed an invalid remote and this check has a
+  ;; significant performance penalty even with caching.
+  ;; (unless (stp-git-valid-remote-p remote)
+  ;;   (error "%s is not a valid remote" remote))
+  ;; Handle empty repositories that do not have any tags.
+  (let ((output (if memoize
+                    (stp-git-remote-hash-alist-memoized remote)
+                  (stp-git-remote-hash-alist-basic remote))))
+    (unless (equal output "")
+      (mapcar (lambda (list)
+                (dsb (hash ref)
+                    list
+                  (cons hash
+                        (s-chop-prefixes prefixes
+                                         ref))))
+              (-filter (lambda (list)
+                         (if prefixes-supplied-p
+                             (-any (lambda (prefix)
+                                     (dsb (_hash ref)
+                                         list
+                                       (s-starts-with-p prefix ref)))
+                                   prefixes)
+                           t))
+                       (mapcar (lambda (line)
+                                 (s-split rem-positive-whitespace-regexp line))
+                               (s-split "\n" output)))))))
+
+(cl-defun stp-git-remote-hash-tag-alist (remote &key (memoize t))
+  "Return an alist that maps hashes to tags for REMOTE.
+
+Memoization is used when MEMOIZE is non-nil."
+  (stp-git-remote-hash-alist remote :prefixes '("refs/tags/") :memoize memoize))
+
+(cl-defun stp-git-remote-tags (remote &optional keep-dereferences &key (memoize t))
+  (let ((tags (mapcar #'cdr (stp-git-remote-hash-tag-alist remote :memoize memoize))))
+    (if keep-dereferences
+        tags
+      (cl-remove-if (-partial #'s-ends-with-p "^{}") tags))))
+
+(cl-defun stp-git-remote-tag-p (remote rev &key (memoize t))
+  (member rev (stp-git-remote-tags remote t :memoize memoize)))
+
+(cl-defun stp-git-remote-hash-head-alist (remote &key (memoize t))
+  "Return an alist that maps hashes to heads for REMOTE.
+
+Memoization is used when MEMOIZE is non-nil."
+  ;; Manually add HEAD instead of using the branch refs/heads/HEAD. This branch
+  ;; should not exist as it is likely to create confusion but some repositories
+  ;; may have created it by mistake.
+  (cons (cons (stp-git-remote-head remote :memoize memoize) "HEAD")
+        ;; A few repositories have a branch that is named HEAD. This should be
+        ;; ignored.
+        (map-remove (lambda (_hash head)
+                      (string= head "HEAD"))
+                    (stp-git-remote-hash-alist remote
+                                               :prefixes '("refs/heads/")
+                                               :memoize memoize))))
+
+(cl-defun stp-git-remote-head (remote &key (memoize t))
+  "Return HEAD for REMOTE."
+  (car (rassoc "HEAD" (stp-git-remote-hash-alist remote :memoize memoize))))
+
+(cl-defun stp-git-remote-heads (remote &key (memoize t))
+  (mapcar #'cdr (stp-git-remote-hash-head-alist remote :memoize memoize)))
+
+(cl-defun stp-git-remote-head-p (remote ref &key (memoize t))
+  (member ref (stp-git-remote-heads remote :memoize memoize)))
+
+;; Note that this will not work will minimal copies of a repositories created
+;; using CLI options such as those used in `stp-git-count-remote-commits'.
+(cl-defun stp-git-hashes (path rev &key max)
+  "Return a list of the hashes reachable from REV at PATH.
+
+Hashes are sorted starting with the most recent. If REV is nil
+then HEAD will be used. If REV is t then all hashes will be
+returned. If MAX is non-nil then no more than MAX hashes will be
+returned."
+  (setq rev (cond
+             ((null rev)
+              "HEAD")
+             ((eq rev t)
+              "--all")
+             (t
+              rev)))
+  (let ((default-directory path)
+        (cmd (append (stp-git-command)
+                     '("reflog" "show" rev)
+                     (and max (list "-n" (number-to-string max)))
+                     (list "--pretty='%%H'"))))
+    (s-split "\n" (rem-run-command cmd :error t) t)))
+
+(cl-defun stp-git-remote-rev-to-hash (remote rev &key (memoize t))
+  "Convert REV to a hash using REMOTE.
+
+Refs that do not match any hash will remain unchanged."
+  (or (car (or (rassoc rev (stp-git-remote-hash-head-alist remote :memoize memoize))
+               ;; Be aware that some remotes will not return hashes for
+               ;; dereferenced tags in which case it will not be possible to
+               ;; determine the hash for the tag. This is why there is a
+               ;; fallback.
+               (rassoc (stp-git-tag-append-dereference rev) (stp-git-remote-hash-tag-alist remote :memoize memoize))
+               (rassoc rev (stp-git-remote-hash-tag-alist remote :memoize memoize))))
+      rev))
+
+(cl-defun stp-git-remote-head-to-hash (remote rev &key (memoize t))
+  "If REV is a head, convert it to a hash using REMOTE.
+
+Otherwise, return REV."
+  (or (car (rassoc rev (stp-git-remote-hash-head-alist remote :memoize memoize)))
+      rev))
+
+(cl-defun stp-git-remote-tag-to-hash (remote rev &key (memoize t))
+  "If REV is a tag, convert it to a hash using REMOTE.
+
+Otherwise, return REV."
+  (or (car (rassoc rev (stp-git-remote-hash-tag-alist remote :memoize memoize)))
+      rev))
+
+(cl-defun stp-git-remote-hash-to-head (remote rev &key (memoize t))
+  "If REV is a hash that corresponds to a head on REMOTE, return the head.
+
+Otherwise, return REV."
+  (or (map-elt (stp-git-remote-hash-head-alist remote :memoize memoize) rev)
+      rev))
+
+(defun stp-git-rev-to-hash (path rev)
+  (let ((default-directory path))
+    (stp-git-remote-rev-to-hash "." rev :memoize nil)))
+
+(defun stp-git-head-to-hash (path rev)
+  (let ((default-directory path))
+    (stp-git-remote-head-to-hash "." rev :memoize nil)))
+
+(defun stp-git-tag-to-hash (path rev)
+  (let ((default-directory path))
+    (stp-git-remote-tag-to-hash "." rev :memoize nil)))
+
+(defun stp-git-hash-to-head (path rev)
+  (let ((default-directory path))
+    (stp-git-remote-hash-to-head "." rev :memoize nil)))
+
+(defun stp-git-tag-strip-dereference (tag)
+  "Remove the ^{} following a TAG name."
+  ;; A tag followed by ^{} means to dereference the tag until a commit is
+  ;; reached.
+  (s-chop-suffix "^{}" tag))
+
+(defun stp-git-tag-append-dereference (tag)
+  "Append ^{} to TAG unless it already has that suffix."
+  (if (s-ends-with-p "^{}" tag)
+      tag
+    (concat tag "^{}")))
+
+(cl-defun stp-git-remote-dereferencable-tag-p (remote rev &key (memoize t))
+  (car (rassoc (stp-git-tag-append-dereference rev)
+               (stp-git-remote-hash-tag-alist remote :memoize memoize))))
+
+(cl-defun stp-git-remote-rev-to-tag (remote rev &key keep-dereference (memoize t))
+  "If REV is a hash that corresponds to a tag on REMOTE, return the tag.
+
+Otherwise, return REV."
+  (or (let ((tag (map-elt (stp-git-remote-hash-tag-alist remote :memoize memoize) rev)))
+        (if keep-dereference
+            tag
+          (stp-git-tag-strip-dereference tag)))
+      rev))
+
+(cl-defun stp-git-rev-to-tag (path rev &key keep-dereference)
+  (let ((default-directory path))
+    (stp-git-remote-rev-to-tag "." rev :keep-dereference keep-dereference :memoize nil)))
+
+(defun stp-git-hash= (hash hash2)
+  (and (>= (length hash) 6)
+       (>= (length hash2) 6)
+       (or (s-prefix-p hash hash2)
+           (s-prefix-p hash2 hash))))
+
+(cl-defun stp-git-count-commits (path rev rev2 &key count-merges (handle-unrelated t))
+  "Count the number of commits from REV to REV2.
+
+More precisely, compute the number of commits M and N in
+REV..REV2 and REV2..REV in the local git repository at PATH.
+
+If M is non-zero and N is zero, then return M. If M is zero and N
+is non-zero, return -N (this represents going backwards from REV2
+to REV). If both are non-zero, return a list of the form (M N).
+
+When COUNT-MERGES is non-nil, merge commits are included in the
+count. When it is nil they are ignored.
+
+If HANDLE-UNRELATED is non-nil, then nil will be returned if REV
+and REV2 do not share a common ancestor."
+  ;; This has a significant performance penalty. `rem-run-command' will produce
+  ;; an error below anyway if a revision is invalid.
+  ;;
+  ;; (unless (stp-git-valid-rev-p path rev)
+  ;;   (error "%s is not a valid ref or hash for %s" rev path))
+  ;; (unless (stp-git-valid-rev-p path rev2)
+  ;;   (error "%s is not a valid ref or hash for %s" rev2 path))
+  (let ((default-directory path))
+    (cl-flet ((common-ancestor-exists-p (rev rev2)
+                (let ((cmd (append (stp-git-command) (list "merge-base" rev rev2))))
+                  ;; git merge-base returns 0 when a common ancestor exists and
+                  ;; 1 when it does not. Other statuses indicate errors.
+                  (= (rem-run-command cmd
+                                      :return 'exit-code
+                                      :validate (lambda (exit-code _)
+                                                  (member exit-code '(0 1)))
+                                      :error t)
+                     0)))
+              (count-commits-forward (rev rev2)
+                ;; "--since" (number-to-string (min (stp-git-timestamp path rev)
+                ;; (stp-git-timestamp path rev2))) was previously used to ignore
+                ;; commits that are older than either revision. This was done
+                ;; because there can be commits that are not excluded just by
+                ;; the range if one revision is from a branch that was never
+                ;; merged upstream. This can occur for example when a local dev
+                ;; branch is used that pull requests are merged into before they
+                ;; are approved upstream.
+                ;;
+                ;; However, it can also exclude old commits that were merged
+                ;; into such a dev branch recently and should thus not be
+                ;; excluded. A better system is to delete and recreated such a
+                ;; dev branch from main instead of reusing it.
+                (let ((cmd (append (stp-git-command)
+                                   (list "rev-list")
+                                   (and (not count-merges) (list "--no-merges"))
+                                   (list "--count" (format "%s..%s" rev rev2)))))
+                  (string-to-number (rem-run-command cmd :error t)))))
+      (let ((m (count-commits-forward rev rev2))
+            (n (count-commits-forward rev2 rev)))
+        (cond
+         ((and (= m 0) (= n 0))
+          0)
+         ((= n 0)
+          m)
+         ((= m 0)
+          (- n))
+         ;; When one or both m and n are zero rev and rev2 must have a common
+         ;; ancestor so we don't need to check for a common ancestor in the
+         ;; above cases regardless of the value of handle-unrelated. This will
+         ;; be faster in most cases since usually m and n will not both be
+         ;; non-zero (this will typically only happen when there is a fork
+         ;; installed).
+         ((or (not handle-unrelated) (common-ancestor-exists-p rev rev2))
+          (list m n))
+         ;; When no common ancestor exists and handle-unrelated is nil, return
+         ;; nil.
+         (t
+          nil))))))
+
+(defun stp-git-clone (remote path)
+  (rem-run-command (append (stp-git-command) (list "clone" remote path)) :error t))
+
+(defvar stp-git-cache-directory (f-join user-emacs-directory "stp/cache/git-repos/"))
+
+(defun stp-git-minimal-clone (remote path &optional branch)
+  "Make a lightweight clone of REMOTE at PATH.
+
+This contains the commit history but not the actual blobs. When
+BRANCH is non-nil, use --single-branch to only clone the history
+of that specific branch."
+  (let ((cmd (append (stp-git-command)
+                     '("clone" "--bare" "--no-checkout" "--filter=blob:none")
+                     (and branch (format " --single-branch --branch '%s'" branch))
+                     (list remote path))))
+    (rem-run-command cmd :error t)))
+
+(defun stp-git-cache-hash-directory (remote)
+  (when (f-dir-p remote)
+    (setq remote (f-canonical remote)))
+  ;; This doesn't work for very long remotes (which can occur when remote is
+  ;; actually several remotes that were joined together by
+  ;; `stp-git-cached-repo-path').
+  ;;
+  ;; (->> remote
+  ;;      ;; URLs and local filenames are converted to hex to avoid
+  ;;      ;; conflicts. If we only replaced /'s with -'s for example,
+  ;;      ;; local files and URLs could theoretically resolve to the
+  ;;      ;; same cached path.
+  ;;      (mapcar (lambda (char)
+  ;;                (format "%02x" char)))
+  ;;      (s-join "-"))
+  (secure-hash 'sha512 remote))
+
+(defun stp-git-cached-repo-path (remote)
+  "Create or update the locally cached copy of REMOTE.
+
+When there is a list of remotes, use a combination of all the
+remote repositories for caching."
+  (let ((id (if (listp remote)
+                (s-join "|" remote)
+              remote)))
+   (f-join stp-git-cache-directory (stp-git-cache-hash-directory id))))
+
+(defvar stp-git-cached-repo-timestamp-suffix "-timestamp")
+
+(defun stp-git-cached-repo-timestamp-path (path)
+  (f-join stp-git-cache-directory (format "%s%s" path stp-git-cached-repo-timestamp-suffix)))
+
+(stp-defmemoized stp-git-ensure-cached-repo (remotes &optional branch)
+  (if (listp remotes)
+      ;; Fetch in reverse order so that branches and tags in earlier remotes
+      ;; take precedence.
+      (setq remotes (reverse remotes))
+    (setq remotes (list remotes)))
+  (unless (f-dir-p stp-git-cache-directory)
+    (f-mkdir-full-path stp-git-cache-directory))
+  (let* ((path (stp-git-cached-repo-path remotes))
+         (tpath (stp-git-cached-repo-timestamp-path path)))
+    ;; Ensure that the cached repository has been created.
+    (unless (f-dir-p path)
+      (stp-git-minimal-clone (car remotes) path branch)
+      (setq remotes (cdr remotes)))
+    ;; Fetch and update all branches from all remotes.
+    (let ((default-directory path))
+      (cl-dolist (remote remotes)
+        ;; :force t is required in case a branch is deleted upstream. We don't
+        ;; want :no-new-tags t because the tags should be kept in refs/tags for
+        ;; cached repos since they correspond to a single package.
+        (stp-git-fetch remote :force t :refspec "*:*")))
+    (f-write (format "%f" (float-time)) 'utf-8 tpath)
+    path))
+
+(defvar stp-git-stale-cached-repo-interval (timer-duration "1 year")
+  "Cached repos can be deleted if they have not been used this long.")
+
+(defun stp-git-delete-stale-cached-repos ()
+  (when (f-dir-p stp-git-cache-directory)
+    (f-entries stp-git-cache-directory
+               (lambda (file)
+                 (and (s-ends-with-p stp-git-cached-repo-timestamp-suffix file)
+                      (let ((updated (string-to-number (f-read file 'utf-8))))
+                        (when (> (- (float-time) updated)
+                                 stp-git-stale-cached-repo-interval)
+                          (f-delete (s-chop-suffix stp-git-cached-repo-timestamp-suffix file) t)
+                          (f-delete file))))))))
+
+(cl-defun stp-git-count-remote-commits (remotes rev rev2 &key count-merges (handle-unrelated t))
+  "Count the number of commits from REV to REV2.
+
+This is similar to `stp-git-count-commits' for remote
+repositories. REMOTES can be either a single repository or a list
+of multiple repositories."
+  ;; branch is ignored because it does not save much space and branches are not
+  ;; known for stable git packages which prevents using it there anyway. This
+  ;; would result in multiple cached versions of the same repository if it was
+  ;; changed from stable to unstable for example.
+  (let* ((stp-allow-bare-repository-override t)
+         (path (stp-git-ensure-cached-repo remotes)))
+    (stp-git-count-commits path rev rev2 :count-merges count-merges :handle-unrelated handle-unrelated)))
+
+(stp-defmemoized stp-git-timestamp (path rev)
+  "Return the UNIX timestamp for when REV was commited at PATH."
+  (let ((default-directory path)
+        (cmd (append (stp-git-command) (list "show" "--no-patch" "--format=%ct" (format "%s^{commit}" rev)))))
+    ;; Pipe to /dev/null to suppress warnings about ambiguous ref or hashs.
+    ;; These can occur when the git repository contains a branch or tag called
+    ;; HEAD.
+    ;;
+    ;; The ^{commit} syntax forces git to show the commit object pointed to
+    ;; by a tag rather than the tag.
+    (string-to-number (rem-run-command cmd :error t :nostderr t))))
+
+(defun stp-git-remote-timestamp (remote rev)
+  "Return the timestamp for REV on REMOTE.
+
+This is similar to `stp-git-timestamp' but for remote repositories."
+  (let* ((stp-allow-bare-repository-override t)
+         (path (stp-git-ensure-cached-repo remote)))
+    (stp-git-timestamp path rev)))
+
+(cl-defun stp-git-describe (rev &key (tags t))
+  (let ((output (rem-run-command (append (stp-git-command)
+                                         '("describe")
+                                         (rem-maybe-args "--tags" tags)
+                                         (list rev)))))
+    (when output
+      ;; Keep only the tag by removing the number of commits and the hash.
+      (s-join "-" (butlast (s-split "-" (s-trim output)) 2)))))
+
+(defun stp-git-last-stable (path rev)
+  (let ((default-directory path))
+    (while (and (setq rev (stp-git-describe rev))
+                (not (stp-version-extract rev))))
+    rev))
+
+(defun stp-git-remote-last-stable (remote rev)
+  "Find the last stable version up to and including REV on REMOTE."
+  (let* ((stp-allow-bare-repository-override t)
+         (path (stp-git-ensure-cached-repo remote)))
+    (stp-git-last-stable path rev)))
+
+(provide 'stp-git-utils)
+
+;; Local Variables:
+;; read-symbol-shorthands: (
+;;   ("dsb" . "cl-destructuring-bind")
+;;   ("mvb" . "cl-multiple-value-bind")
+;;   ("mvs" . "cl-multiple-value-setq")
+;;   ("with-gensyms" . "cl-with-gensyms")
+;;   ("once-only" . "cl-once-only")
+;;   ("dflet" . "noflet")
+;;   ("plet" . "pcase-let")
+;;   ("plet*" . "pcase-let*")
+;;   ("psetq*" . "pcase-setq")
+;;   ("pdolist" . "pcase-dolist")
+;;   ("plambda" . "pcase-lambda")
+;;   ("pdefmacro" . "pcase-defmacro")
+;;   ("epcase" . "pcase-exhaustive")
+;;   ("fn" . "rem-fn")
+;;   ("fn1" . "rem-fn1")
+;;   ("fn2" . "rem-fn2")
+;;   ("fn3" . "rem-fn3")
+;;   ("fn4" . "rem-fn4")
+;;   ("fn5" . "rem-fn5")
+;;   ("fn6" . "rem-fn6")
+;;   ("fn7" . "rem-fn7")
+;;   ("fn8" . "rem-fn8")
+;;   ("fn9" . "rem-fn9")
+;;   ("fn10" . "rem-fn10"))
+;; End:
+;;; stp-git-utils.el ends here

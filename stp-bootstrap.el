@@ -1,0 +1,106 @@
+;;; stp-bootstrap.el --- Bootstrap subtree-package -*- lexical-binding: t; -*-
+
+;;; Code:
+
+(defvar stp-source-directory)
+(defvar stp-package-source-directories '("clients" "contrib" "core" "elisp" "extensions" "lisp" "src"))
+
+(defun stp-bootstrap ()
+  (setq load-path (append (mapcar (lambda (dir)
+                                    ;; Don't use `f-join' as we do elsewhere in
+                                    ;; STP as it is an external dependency that
+                                    ;; will not be available during
+                                    ;; bootstrapping.
+                                    (expand-file-name (concat dir "/") stp-source-directory))
+                                  ;; We need dash, f and s because they are used
+                                  ;; by STP.
+                                  '("dash"
+                                    "f"
+                                    "s" ;; s needs to be here because it is
+                                    ;; required by f.
+                                    ))
+                          load-path)))
+
+(defun stp-compute-load-path (pkg-path &optional paths)
+  (setq pkg-path (file-name-as-directory pkg-path))
+  (unless (file-name-absolute-p pkg-path)
+    (user-error "%s is not an absolute path" pkg-path))
+  ;; Include package directories and some sub-directories.
+  (push pkg-path paths)
+  (dolist (subdir stp-package-source-directories)
+    (let ((path (expand-file-name subdir pkg-path)))
+      (when (file-directory-p path)
+        (push path paths)
+        (setq paths (stp-compute-load-path path paths)))))
+  paths)
+
+(defun stp-update-load-path (pkg-path &optional interactive-p)
+  "Add all appropriate directories in PKG-PATH to the `load-path'.
+
+When INTERACTIVE-P indicates if the function was called interactively."
+  (interactive "DDirectory: \nd")
+  (dolist (path (stp-compute-load-path pkg-path))
+    (add-to-list 'load-path path))
+  (when interactive-p
+    (stp-msg "Updated the load path for %s" (file-name-nondirectory (directory-file-name pkg-path)))))
+
+(defun stp-compute-load-paths (&optional dir)
+  (setq dir (or dir stp-source-directory))
+  (let (paths)
+    ;; We do not use `directory-files-recursively' because it includes too much.
+    ;; Not all elisp files are meant to be in the `load-path'.
+    (dolist (pkg-path (directory-files dir t))
+      (when (and (file-directory-p pkg-path)
+                 ;; Do not consider ".", ".." or any path that ends with "/." or
+                 ;; "/..". The intent here is to prevent the current directory
+                 ;; and the parent directory from being considered. There are
+                 ;; certianly nicer ways to do this but this one does not require
+                 ;; dependencies such as f.
+                 (not (string= pkg-path "."))
+                 (not (string= pkg-path ".."))
+                 (not (string= (substring pkg-path -2) "/."))
+                 (not (string= (substring pkg-path -3) "/..")))
+        (setq paths (stp-compute-load-path pkg-path paths))))
+    paths))
+
+(defun stp-update-load-paths (&optional dir interactive-p)
+  "Add all appropriate package directories to the `load-path'.
+
+DIR is the directory to search for packages. INTERACTIVE-P is
+non-nil when called interactively."
+  (interactive (list nil t))
+  (dolist (path (stp-compute-load-paths dir))
+    (add-to-list 'load-path path))
+  (when interactive-p
+    (stp-msg "Load paths updated")))
+
+(provide 'stp-bootstrap)
+
+;; Local Variables:
+;; read-symbol-shorthands: (
+;;   ("dsb" . "cl-destructuring-bind")
+;;   ("mvb" . "cl-multiple-value-bind")
+;;   ("mvs" . "cl-multiple-value-setq")
+;;   ("with-gensyms" . "cl-with-gensyms")
+;;   ("once-only" . "cl-once-only")
+;;   ("dflet" . "noflet")
+;;   ("plet" . "pcase-let")
+;;   ("plet*" . "pcase-let*")
+;;   ("psetq*" . "pcase-setq")
+;;   ("pdolist" . "pcase-dolist")
+;;   ("plambda" . "pcase-lambda")
+;;   ("pdefmacro" . "pcase-defmacro")
+;;   ("epcase" . "pcase-exhaustive")
+;;   ("fn" . "rem-fn")
+;;   ("fn1" . "rem-fn1")
+;;   ("fn2" . "rem-fn2")
+;;   ("fn3" . "rem-fn3")
+;;   ("fn4" . "rem-fn4")
+;;   ("fn5" . "rem-fn5")
+;;   ("fn6" . "rem-fn6")
+;;   ("fn7" . "rem-fn7")
+;;   ("fn8" . "rem-fn8")
+;;   ("fn9" . "rem-fn9")
+;;   ("fn10" . "rem-fn10"))
+;; End:
+;;; stp-bootstrap.el ends here
