@@ -4,12 +4,11 @@
 ;; Author: David J. Rosenbaum <djr7c4@gmail.com>
 ;; Keywords: utilities
 ;; URL: https://github.com/djr7C4/rem
-;; Version: 0.10.0
+;; Version: 0.11.0
 ;; Package-Requires: (
 ;;   (emacs "29")
 ;;   (f "0.21.0")
 ;;   (llama "1.0.0")
-;;   (noflet "0.0.15")
 ;;   (transient "0.12.0"))
 ;;
 ;; This program is free software: you can redistribute it and/or modify
@@ -108,7 +107,7 @@ that it is connected to. Each node must be comparable using
 ;;; Elisp
 (defvar rem-load-blacklist (list "-pkg\\.\\(el\\|elc\\)$" "\\(^\\|/\\).cask/" "\\(^\\|/\\).eask/"))
 
-(cl-defun rem-elisp-files-to-load (dir &key compressed recursive)
+(cl-defun rem-elisp-files-to-load (dir &key (blacklist rem-load-blacklist) compressed recursive)
   (let* ((extensions (if compressed
                          '(".el" ".el.gz")
                        '(".el")))
@@ -124,7 +123,7 @@ that it is connected to. Each node must be comparable using
                                           (and (cl-some (lambda (extension)
                                                           (s-ends-with-p extension path))
                                                         extensions)
-                                               (not (cl-some (-rpartial #'string-match-p path) rem-load-blacklist)))))
+                                               (not (cl-some (-rpartial #'string-match-p path) blacklist)))))
                                     recursive))))
     (setq files (cl-remove-duplicates files :test #'equal))))
 
@@ -253,6 +252,17 @@ It is similar to `llama' but wraps BODY in an implicit `progn'."
   `(progn ,@(mapcar (lambda (k) `(rem-define-fn ,k)) (-iota 9 2))))
 
 (rem-define-fns)
+
+(cl-defmacro rem-dflet ((&rest bindings) &rest body)
+  "This is the same as `cl-flet' but with dynamic bindings."
+  `(cl-letf ,(mapcar (lambda (binding)
+                       (dsb (sym args &rest fun-body)
+                           binding
+                         `((symbol-function ',sym)
+                           (lambda ,args
+                             ,@fun-body))))
+                     bindings)
+     ,@body))
 
 (defun rem-maybe-args (&rest args)
   "Selectively create an argument list.
@@ -1027,10 +1037,12 @@ unless RETURN was passed explicitly."
 ;;; Memoization
 (defvar rem-memoization-data (make-hash-table :test #'eq))
 
+(defvar rem-no-memoized-value (gensym))
+
 (cl-defun rem-memoize (fun &key (test #'equal))
   "Create a memoized version of FUN.
 
-This is done caching values in a hash table with TEST. By
+This is done by caching values in a hash table with TEST. By
 default, cache entries are never removed. Use
 `rem-reset-memoization' to clear the hash table. When FUN is a
 symbol, set its function to the new memoized version. Otherwise,
@@ -1052,15 +1064,15 @@ return the memoized function."
                   (let* ((key ,(if (consp key-vars)
                                    `(list ,@key-vars)
                                  `,key-vars))
-                         (memoized-value (gethash key ,table)))
-                    (if memoized-value
-                        memoized-value
-                      (setf (gethash key ,table) (funcall ,(symbol-function fun) ,@vars)))))
+                         (memoized-value (gethash key ,table rem-no-memoized-value)))
+                    (if (eq memoized-value rem-no-memoized-value)
+                        (setf (gethash key ,table) (funcall ,(symbol-function fun) ,@vars))
+                      memoized-value)))
              `(lambda (&rest args)
-                (let ((memoized-value (gethash args ,table)))
-                  (if memoized-value
-                      memoized-value
-                    (setf (gethash args ,table) (apply ,(symbol-function fun) args))))))))
+                (let ((memoized-value (gethash args ,table rem-no-memoized-value)))
+                  (if (eq memoized-value rem-no-memoized-value)
+                      (setf (gethash args ,table) (apply ,(symbol-function fun) args))
+                    memoized-value))))))
          (old-data (gethash fun table))
          (data (list table (symbol-function fun) wrapped-fun)))
     (when old-data
@@ -1099,6 +1111,14 @@ Otherwise, return the original function value."
         data
       (clrhash table)
       t)))
+
+(defun rem-get-memoization-data (fun)
+  (let ((data (gethash fun rem-memoization-data)))
+    (unless data
+      (error "The function %S is not memoized" fun))
+    (dsb (table orig-fun wrapped-fun)
+        data
+      (list :table table :orig-fun orig-fun :wrapped-fun wrapped-fun))))
 
 (cl-defmacro rem-defmemoize (name args &rest body)
   "Define a memoized function named NAME with ARGS and BODY."
@@ -1151,7 +1171,7 @@ It does not match ambiguous things such as abc.xyz.")
 ;;   ("mvs" . "cl-multiple-value-setq")
 ;;   ("with-gensyms" . "cl-with-gensyms")
 ;;   ("once-only" . "cl-once-only")
-;;   ("dflet" . "noflet")
+;;   ("dflet" . "rem-dflet")
 ;;   ("plet" . "pcase-let")
 ;;   ("plet*" . "pcase-let*")
 ;;   ("psetq*" . "pcase-setq")
